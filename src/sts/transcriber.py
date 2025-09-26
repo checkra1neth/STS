@@ -299,10 +299,12 @@ def load_model(
                 compute_type=candidate,
                 **kwargs,
             )
-        except RuntimeError as exc:  # pragma: no cover - depends on backend availability
+        except Exception as exc:  # pragma: no cover - depends on backend availability
             last_error = exc
             error_message = str(exc).lower()
-            is_int16_failure = "int16" in candidate and "int16" in error_message
+            is_int16_candidate = "int16" in candidate
+            mentions_int16_failure = "int16" in error_message
+            is_int16_failure = is_int16_candidate and mentions_int16_failure
 
             # Fall back only when the backend explicitly complains about int16
             # support. Otherwise re-raise to avoid hiding real issues.
