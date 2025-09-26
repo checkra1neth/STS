@@ -79,11 +79,20 @@ def load_model(
 ) -> WhisperModel:
     """Load an optimized Whisper model via faster-whisper."""
 
+    kwargs = {
+        "device": device,
+        "compute_type": compute_type,
+    }
+
+    if cpu_threads is not None:
+        # The faster-whisper bindings expose thread configuration via intra/inter
+        # parameters. Limiting the intra-threads count allows the caller to avoid
+        # saturating the entire CPU on smaller machines.
+        kwargs["intra_threads"] = cpu_threads
+
     return WhisperModel(
         model_size,
-        device=device,
-        compute_type=compute_type,
-        cpu_threads=cpu_threads,
+        **kwargs,
     )
 
 
