@@ -11,14 +11,15 @@ from typing import Optional
 import sounddevice as sd
 
 from .transcriber import (
-    capture_audio, 
-    load_model, 
-    transcribe_audio, 
-    extract_audio_from_video, 
+    capture_audio,
+    load_model,
+    transcribe_audio,
+    extract_audio_from_video,
     is_video_file,
     capture_system_audio,
     find_system_audio_devices,
-    stream_transcribe
+    stream_transcribe,
+    get_best_stream_profile,
 )
 
 
@@ -76,8 +77,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--compute-type",
-        default="int8",
-        help="Тип вычислений faster-whisper (int8, int8_float16, float16, float32). int8 экономит память.",
+        default="auto",
+        help=(
+            "Тип вычислений faster-whisper (int8, int8_float16, float16, float32, auto). "
+            "Значение auto выбирает оптимальный баланс скорости и качества."
+        ),
     )
     parser.add_argument(
         "--cpu-threads",
@@ -240,11 +244,14 @@ def main(argv: Optional[list[str]] = None) -> None:
                 )
                 model_name = multilingual_candidate
 
+        profile = get_best_stream_profile()
+        cpu_threads = args.cpu_threads if args.cpu_threads is not None else profile.cpu_threads
+
         model = load_model(
             model_name,
             device=args.device,
             compute_type=args.compute_type,
-            cpu_threads=args.cpu_threads,
+            cpu_threads=cpu_threads,
         )
 
         def print_result(result):
@@ -253,14 +260,11 @@ def main(argv: Optional[list[str]] = None) -> None:
                 with open(args.output, 'a', encoding='utf-8') as f:
                     f.write(f"{result['text']} ")
 
-        # Используем минимальную задержку для консольной версии
-        chunk_duration = 0.8 if args.model == 'tiny' else 1.5
-        
         stream_transcribe(
             model=model,
             device=_parse_input_device(args.input_device),
             language=requested_language,
-            chunk_duration=chunk_duration,  # Адаптивная задержка
+            profile=profile,
             callback=print_result
         )
         return

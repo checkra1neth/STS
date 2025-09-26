@@ -1,10 +1,10 @@
 """Web interface for real-time speech transcription."""
 
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, jsonify
 from flask_socketio import SocketIO, emit
 import threading
 import time
-from .transcriber import load_model, StreamTranscriber
+from .transcriber import load_model, StreamTranscriber, get_best_stream_profile
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'sts-transcription-secret'
@@ -107,54 +107,24 @@ def handle_start_transcription(data):
     try:
         model_name = data.get('model', 'small')
         language = data.get('language', 'auto')
-        speed = data.get('speed', 'fast')
-        
+        profile = get_best_stream_profile()
+
         if language == 'auto':
             language = None
-        
-        # Настройки для КАЧЕСТВА + СКОРОСТИ
-        speed_settings = {
-            'instant': {
-                'chunk_duration': 1.5,  # Увеличили для стабильности
-                'cpu_threads': 4,  # Уменьшили для стабильности
-                'beam_size': 5,  # Увеличили для качества
-                'vad_filter': True,
-                'overlap': 0.2,  # Уменьшили перекрытие
-                'temperature': 0.0,
-                'use_threading': True
-            },
-            'lightning': {
-                'chunk_duration': 2.0,
-                'cpu_threads': 4,
-                'beam_size': 5,
-                'vad_filter': True,
-                'overlap': 0.15,
-                'temperature': 0.0,
-                'use_threading': True
-            },
-            'fast': {
-                'chunk_duration': 2.5,
-                'cpu_threads': 2,
-                'beam_size': 5,
-                'vad_filter': True,
-                'overlap': 0.1,
-                'temperature': 0.0,
-                'use_threading': False
-            },
-            'quality': {
-                'chunk_duration': 4.0,
-                'cpu_threads': 2,
-                'beam_size': 8,
-                'vad_filter': True,
-                'overlap': 0.05,
-                'temperature': 0.0,
-                'use_threading': False
-            }
+
+        settings = {
+            'chunk_duration': profile.chunk_duration,
+            'cpu_threads': profile.cpu_threads,
+            'beam_size': profile.beam_size,
+            'vad_filter': profile.vad_filter,
+            'overlap': profile.overlap_ratio,
+            'temperature': profile.temperature,
+            'use_threading': profile.use_threading,
         }
-        settings = speed_settings.get(speed, speed_settings['instant'])
-        
+
         # Проверяем, есть ли модель в кэше
-        model_key = f"{model_name}_{settings['cpu_threads']}"
+        cpu_threads = settings['cpu_threads'] if settings['cpu_threads'] is not None else 'auto'
+        model_key = f"{model_name}_{cpu_threads}"
         if model_key in preloaded_models:
             model = preloaded_models[model_key]
             emit('status', {'message': 'Модель загружена из кэша. Начинаю транскрибацию...'})
@@ -165,14 +135,19 @@ def handle_start_transcription(data):
             model = load_model(
                 model_name,
                 device='cpu',
-                compute_type='int8',  # Самый быстрый тип вычислений
+                compute_type='auto',
                 cpu_threads=settings['cpu_threads']
             )
             
             # Кэшируем модель для повторного использования
             preloaded_models[model_key] = model
         
-        emit('status', {'message': 'Модель загружена. Начинаю транскрибацию...'})
+        emit('status', {
+            'message': (
+                'Модель загружена. Используется режим баланса качества и скорости '
+                f'({profile.chunk_duration:.1f}с / beam {profile.beam_size}).'
+            )
+        })
         
         # Очищаем предыдущие результаты
         all_transcripts = []
@@ -205,7 +180,7 @@ def handle_start_transcription(data):
                     'total_segments': len(all_transcripts)
                 })
         
-        # Запускаем МГНОВЕННУЮ транскрибацию
+        # Запускаем оптимизированную транскрибацию
         success = transcriber.start(
             model=model,
             device=None,  # Автоматически найдет BlackHole
@@ -252,21 +227,23 @@ def handle_clear_transcript():
 def preload_models():
     """Предзагрузка моделей для МГНОВЕННОЙ работы."""
     global preloaded_models
-    
+
     print("🚀 ПРЕДЗАГРУЖАЮ МОДЕЛИ ДЛЯ МГНОВЕННОЙ РАБОТЫ...")
+
+    profile = get_best_stream_profile()
     
     # ПРИОРИТЕТ: Tiny для МАКСИМАЛЬНОЙ скорости
     try:
-        tiny_model = load_model('tiny', device='cpu', compute_type='int8', cpu_threads=8)
-        preloaded_models['tiny_8'] = tiny_model
+        tiny_model = load_model('tiny', device='cpu', compute_type='auto', cpu_threads=profile.cpu_threads or 8)
+        preloaded_models[f"tiny_{profile.cpu_threads or 'auto'}"] = tiny_model
         print("⚡ Модель Tiny ГОТОВА К МГНОВЕННОЙ РАБОТЕ")
     except Exception as e:
         print(f"❌ Ошибка Tiny: {e}")
         
     # Base для баланса
     try:
-        base_model = load_model('base', device='cpu', compute_type='int8', cpu_threads=6)
-        preloaded_models['base_6'] = base_model
+        base_model = load_model('base', device='cpu', compute_type='auto', cpu_threads=profile.cpu_threads or 6)
+        preloaded_models[f"base_{profile.cpu_threads or 'auto'}"] = base_model
         print("✅ Модель Base предзагружена")
     except Exception as e:
         print(f"⚠️ Ошибка Base: {e}")

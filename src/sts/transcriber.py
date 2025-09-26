@@ -24,6 +24,32 @@ except ImportError:
 
 
 @dataclass
+class StreamProfile:
+    """Tuning parameters for low-latency streaming transcription."""
+
+    name: str
+    chunk_duration: float
+    overlap_ratio: float
+    beam_size: int
+    vad_filter: bool
+    temperature: float
+    use_threading: bool
+    cpu_threads: Optional[int]
+
+
+BEST_STREAM_PROFILE = StreamProfile(
+    name="balanced_realtime",
+    chunk_duration=2.8,
+    overlap_ratio=0.18,
+    beam_size=6,
+    vad_filter=True,
+    temperature=0.0,
+    use_threading=True,
+    cpu_threads=4,
+)
+
+
+@dataclass
 class TranscriptionSegment:
     """A single segment returned by the Whisper model."""
 
@@ -160,6 +186,12 @@ def _merge_with_history(text: str, history: Deque[str]) -> str:
     return cleaned
 
 
+def get_best_stream_profile() -> StreamProfile:
+    """Return the tuned preset that balances quality and latency."""
+
+    return BEST_STREAM_PROFILE
+
+
 def capture_audio(
     destination: Path,
     samplerate: int = 16_000,
@@ -197,14 +229,41 @@ def capture_audio(
     return destination
 
 
+def _recommend_compute_type(device: str) -> str:
+    """Pick the best compute type for a given execution device."""
+
+    normalized = (device or "cpu").lower()
+
+    if normalized.startswith("cuda"):
+        return "float16"
+
+    if normalized.startswith("metal"):
+        return "float16"
+
+    if normalized.startswith("cpu"):
+        return "int16"
+
+    return "int8"
+
+
 def load_model(
     model_size: str = "small",
     *,
     device: str = "cpu",
-    compute_type: str = "int8",
+    compute_type: str = "auto",
     cpu_threads: Optional[int] = None,
 ) -> WhisperModel:
-    """Load an optimized Whisper model via faster-whisper."""
+    """Load an optimized Whisper model via faster-whisper.
+
+    When compute_type is set to ``auto`` the function chooses a high-quality
+    configuration tailored to the selected device. CPU inference uses ``int16``
+    activations for noticeably better accuracy compared to pure int8
+    quantization, while GPU/Metal backends default to fast ``float16``
+    execution.
+    """
+
+    if compute_type == "auto":
+        compute_type = _recommend_compute_type(device)
 
     kwargs = {
         "device": device,
@@ -624,17 +683,33 @@ def stream_transcribe(
     device: Optional[int | str] = None,
     samplerate: int = 16_000,
     channels: int = 2,
-    chunk_duration: float = 5.0,
+    chunk_duration: Optional[float] = None,
     language: Optional[str] = None,
+    profile: Optional[StreamProfile] = None,
     callback=None,
 ) -> None:
     """Stream transcription in real-time with callback for results."""
-    
+
     transcriber = StreamTranscriber()
-    
-    if not transcriber.start(model, device, samplerate, channels, chunk_duration, language, callback):
+    active_profile = profile or BEST_STREAM_PROFILE
+    effective_chunk = chunk_duration if chunk_duration is not None else active_profile.chunk_duration
+
+    if not transcriber.start(
+        model,
+        device,
+        samplerate,
+        channels,
+        effective_chunk,
+        language,
+        beam_size=active_profile.beam_size,
+        vad_filter=active_profile.vad_filter,
+        overlap_ratio=active_profile.overlap_ratio,
+        temperature=active_profile.temperature,
+        use_threading=active_profile.use_threading,
+        callback=callback,
+    ):
         return
-    
+
     try:
         while transcriber.is_recording():
             time.sleep(0.1)
