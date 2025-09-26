@@ -39,9 +39,9 @@ class StreamProfile:
 
 BEST_STREAM_PROFILE = StreamProfile(
     name="balanced_realtime",
-    chunk_duration=2.8,
-    overlap_ratio=0.18,
-    beam_size=6,
+    chunk_duration=2.4,
+    overlap_ratio=0.16,
+    beam_size=5,
     vad_filter=True,
     temperature=0.0,
     use_threading=True,
@@ -85,48 +85,83 @@ def _calculate_overlap(previous: str, current: str, *, max_overlap_chars: int = 
     return 0
 
 
+def _looks_like_duplicate(candidate: str, previous: str) -> bool:
+    """Heuristically determine if candidate repeats previous content."""
+
+    if not candidate or not previous:
+        return False
+
+    candidate_lower = candidate.lower()
+    previous_lower = previous.lower()
+
+    if candidate_lower == previous_lower:
+        return True
+
+    shorter, longer = (
+        (candidate_lower, previous_lower)
+        if len(candidate_lower) <= len(previous_lower)
+        else (previous_lower, candidate_lower)
+    )
+
+    if len(shorter) >= 12 and shorter in longer:
+        return True
+
+    overlap = _calculate_overlap(previous_lower, candidate_lower, max_overlap_chars=len(candidate_lower))
+    if overlap >= max(10, int(len(candidate_lower) * 0.75)):
+        return True
+
+    return False
+
+
 def _strip_repeated_sequences(text: str) -> str:
     """Remove obvious repeated words or short phrases from text."""
 
     if not text:
         return text
 
-    normalized = text
-
-    # Сначала избавляемся от повторяющихся одиночных слов.
-    normalized = _replace_repeating_pattern(normalized, 1)
-    # Затем от повторяющихся пар слов.
-    normalized = _replace_repeating_pattern(normalized, 2)
-
-    return normalized.strip()
-
-
-def _replace_repeating_pattern(text: str, window: int) -> str:
-    """Убирает повторяющиеся последовательности длиной window слов."""
-
     words = text.split()
-    if len(words) <= window * 2:
-        return text
+    if len(words) < 2:
+        return text.strip()
 
     cleaned: List[str] = []
     i = 0
+
     while i < len(words):
-        cleaned.append(words[i])
-        i += 1
+        remaining = len(words) - i
+        max_window = min(6, remaining // 2)
+        window_found = 0
+        reference_lower: Optional[List[str]] = None
 
-        # Проверяем повтор предыдущей последовательности
-        if i >= window:
-            prev_slice = cleaned[-window:]
-            repeat = True
-            for offset in range(window):
-                if i + offset >= len(words) or words[i + offset].lower() != prev_slice[offset].lower():
-                    repeat = False
+        for window in range(max_window, 0, -1):
+            first = words[i : i + window]
+            second = words[i + window : i + 2 * window]
+            if not second:
+                continue
+            if all(f.lower() == s.lower() for f, s in zip(first, second)):
+                window_found = window
+                reference_lower = [w.lower() for w in first]
+                break
+
+        if window_found:
+            cleaned.extend(words[i : i + window_found])
+            i += window_found
+
+            if reference_lower is None:
+                reference_lower = [w.lower() for w in words[i - window_found : i]]
+
+            # Пропускаем повторяющиеся блоки той же длины.
+            while i + window_found <= len(words):
+                candidate = words[i : i + window_found]
+                if all(c.lower() == ref for c, ref in zip(candidate, reference_lower)):
+                    i += window_found
+                else:
                     break
+        else:
+            cleaned.append(words[i])
+            i += 1
 
-            if repeat:
-                i += window
-
-    return " ".join(cleaned)
+    normalized = " ".join(cleaned)
+    return normalized.strip()
 
 
 def _assemble_transcription(parts: Sequence[str]) -> str:
@@ -143,6 +178,9 @@ def _assemble_transcription(parts: Sequence[str]) -> str:
         overlap = _calculate_overlap(cumulative, cleaned)
         if overlap:
             cleaned = cleaned[overlap:].lstrip()
+
+        if cleaned and any(_looks_like_duplicate(cleaned, previous) for previous in collected[-3:]):
+            continue
 
         if cleaned:
             collected.append(cleaned)
@@ -179,6 +217,10 @@ def _merge_with_history(text: str, history: Deque[str]) -> str:
     overlap = _calculate_overlap(previous, cleaned)
     if overlap:
         cleaned = cleaned[overlap:].lstrip()
+
+    for recent in reversed(history):
+        if _looks_like_duplicate(cleaned, recent):
+            return ""
 
     if cleaned:
         history.append(cleaned)
@@ -588,38 +630,43 @@ class StreamTranscriber:
             if self.recording:
                 self.audio_queue.put(indata.copy())
         
+        min_chunk_duration = max(chunk_duration, 0.4)
+        target_chunk_samples = max(int(min_chunk_duration * samplerate), samplerate // 2)
+
         def process_audio_chunks():
             """Process audio chunks in separate thread."""
-            chunk_data = []
+            chunk_data: List[np.ndarray] = []
             chunk_start_time = time.time()
-            
+            chunk_samples = 0
+
             while self.recording or not self.audio_queue.empty():
                 try:
                     # Получаем аудиоданные с таймаутом
                     audio_chunk = self.audio_queue.get(timeout=0.1)
                     chunk_data.append(audio_chunk)
-                    
+                    chunk_samples += len(audio_chunk)
+
                     # Проверяем, прошло ли достаточно времени для обработки чанка
                     current_time = time.time()
-                    if current_time - chunk_start_time >= chunk_duration:
-                        if chunk_data and self.recording:
-                            # Создаем копию данных для обработки в отдельном потоке
-                            chunk_to_process = chunk_data.copy()
-                            
-                            # МГНОВЕННАЯ обработка через пул потоков
-                            def process_chunk_instant():
-                                try:
-                                    combined_chunk = np.concatenate(chunk_to_process, axis=0)
+                    duration_ready = current_time - chunk_start_time >= chunk_duration
+                    samples_ready = chunk_samples >= target_chunk_samples
 
-                                    if not combined_chunk.size:
+                    if (duration_ready or samples_ready) and chunk_data:
+                        combined_chunk = np.concatenate(chunk_data, axis=0)
+                        processed_samples = combined_chunk.shape[0]
+
+                        if processed_samples and self.recording:
+                            def process_chunk_instant(chunk_array=combined_chunk, emitted_time=current_time):
+                                try:
+                                    if not chunk_array.size:
                                         return
 
                                     # Проверяем наличие полезного сигнала, чтобы не тратить время на тишину
-                                    rms = math.sqrt(float(np.mean(combined_chunk**2)))
+                                    rms = math.sqrt(float(np.mean(chunk_array**2)))
                                     if rms < self.silence_threshold:
                                         return
 
-                                    audio_array = _prepare_audio_array(combined_chunk)
+                                    audio_array = _prepare_audio_array(chunk_array)
                                     if not audio_array.size:
                                         return
 
@@ -641,36 +688,85 @@ class StreamTranscriber:
                                         callback({
                                             'text': addition,
                                             'language': result.language,
-                                            'timestamp': current_time,
+                                            'timestamp': emitted_time,
                                             'duration': result.duration,
                                         })
 
                                 except Exception as e:
                                     if self.recording:
                                         print(f"Ошибка: {e}")
-                            
-                            # Отправляем в пул потоков для МГНОВЕННОЙ обработки
+
                             if use_threading:
                                 self.thread_pool.submit(process_chunk_instant)
                             else:
                                 process_chunk_instant()
-                        
-                        # Умное перекрытие для предотвращения дублей
-                        if overlap_ratio > 0 and len(chunk_data) > 10:  # Минимум данных для перекрытия
-                            overlap_size = int(len(chunk_data) * overlap_ratio)
-                            # Ограничиваем размер перекрытия
-                            overlap_size = min(overlap_size, len(chunk_data) // 2)
-                            chunk_data = chunk_data[-overlap_size:] if overlap_size > 0 else []
+
+                        if overlap_ratio > 0 and processed_samples > 0:
+                            overlap_samples = int(processed_samples * overlap_ratio)
+                            if overlap_samples > 0:
+                                chunk_data = [combined_chunk[-overlap_samples:]]
+                                chunk_samples = overlap_samples
+                            else:
+                                chunk_data = []
+                                chunk_samples = 0
                         else:
-                            chunk_data = []  # Полная очистка если мало данных
+                            chunk_data = []
+                            chunk_samples = 0
+
                         chunk_start_time = current_time
-                        
+
                 except queue.Empty:
                     continue
                 except Exception as e:
                     if self.recording:
                         print(f"Ошибка обработки аудио: {e}")
                     break
+
+            if chunk_data and chunk_samples:
+                combined_chunk = np.concatenate(chunk_data, axis=0)
+
+                def flush_chunk(chunk_array=combined_chunk):
+                    try:
+                        if not chunk_array.size:
+                            return
+
+                        rms = math.sqrt(float(np.mean(chunk_array**2)))
+                        if rms < self.silence_threshold:
+                            return
+
+                        audio_array = _prepare_audio_array(chunk_array)
+                        if not audio_array.size:
+                            return
+
+                        result = transcribe_audio(
+                            model,
+                            audio_array,
+                            language=language,
+                            beam_size=beam_size,
+                            temperature=temperature,
+                            vad_filter=vad_filter,
+                            compression_ratio_threshold=1.8,
+                            condition_on_previous_text=False,
+                        )
+
+                        addition = _merge_with_history(result.text, self._emitted_history)
+
+                        if callback and addition:
+                            self._cumulative_text = f"{self._cumulative_text} {addition}".strip()
+                            callback({
+                                'text': addition,
+                                'language': result.language,
+                                'timestamp': time.time(),
+                                'duration': result.duration,
+                            })
+
+                    except Exception as e:
+                        print(f"Ошибка: {e}")
+
+                if use_threading:
+                    self.thread_pool.submit(flush_chunk)
+                else:
+                    flush_chunk()
         
         print("Начинаю потоковую транскрибацию.")
         
