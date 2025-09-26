@@ -9,7 +9,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Deque, List, Optional, Sequence, Set, Union
+from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Set, Union
 
 import numpy as np
 import sounddevice as sd
@@ -21,6 +21,16 @@ try:
     HAS_FFMPEG = True
 except ImportError:
     HAS_FFMPEG = False
+
+# ``whisper_timestamped`` pulls in optional heavy dependencies (openai-whisper, torch).
+# Import lazily so that basic usage keeps working even when the package is not
+# installed. The attribute resolution happens inside ``_transcribe_with_timestamped``.
+try:  # pragma: no cover - optional dependency
+    import whisper_timestamped  # type: ignore
+    HAS_WHISPER_TIMESTAMPED = True
+except Exception:  # pragma: no cover - optional dependency
+    whisper_timestamped = None  # type: ignore[assignment]
+    HAS_WHISPER_TIMESTAMPED = False
 
 
 @dataclass
@@ -56,6 +66,31 @@ class TranscriptionSegment:
     start: float
     end: float
     text: str
+    confidence: Optional[float] = None
+    avg_logprob: Optional[float] = None
+    compression_ratio: Optional[float] = None
+    no_speech_prob: Optional[float] = None
+    words: Optional[List["TranscriptionWord"]] = None
+
+
+@dataclass
+class TranscriptionWord:
+    """Word-level timing and confidence information."""
+
+    start: float
+    end: float
+    text: str
+    confidence: Optional[float] = None
+
+
+@dataclass
+class ConfidenceMetrics:
+    """Aggregated confidence statistics for the transcription."""
+
+    average: float
+    minimum: float
+    maximum: float
+    count: int
 
 
 @dataclass
@@ -66,6 +101,187 @@ class TranscriptionResult:
     segments: List[TranscriptionSegment]
     duration: float
     language: Optional[str]
+    words: Optional[List[TranscriptionWord]] = None
+    word_confidence: Optional[ConfidenceMetrics] = None
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    """Convert arbitrary numeric values to float, returning None on failure."""
+
+    if value is None:
+        return None
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _compute_confidence_metrics(words: Iterable[TranscriptionWord]) -> Optional[ConfidenceMetrics]:
+    """Aggregate confidence statistics for a collection of words."""
+
+    confidences = [confidence for word in words if (confidence := word.confidence) is not None]
+    if not confidences:
+        return None
+
+    total = sum(confidences)
+    count = len(confidences)
+    return ConfidenceMetrics(
+        average=total / count,
+        minimum=min(confidences),
+        maximum=max(confidences),
+        count=count,
+    )
+
+
+def load_word_level_model(
+    name: str,
+    *,
+    device: Optional[str] = None,
+    backend: str = "openai-whisper",
+    download_root: Optional[str] = None,
+    in_memory: bool = False,
+):  # pragma: no cover - depends on optional dependency
+    """Load a Whisper model compatible with whisper-timestamped."""
+
+    if not HAS_WHISPER_TIMESTAMPED:
+        raise ImportError(
+            "Пакет whisper-timestamped не установлен. Установите его и зависимости (openai-whisper)."
+        )
+
+    try:
+        load_fn = getattr(whisper_timestamped, "load_model")  # type: ignore[attr-defined]
+    except AttributeError:
+        from whisper_timestamped.transcribe import load_model as load_fn  # type: ignore
+
+    kwargs: Dict[str, Any] = {"backend": backend, "in_memory": in_memory}
+    if device is not None:
+        kwargs["device"] = device
+    if download_root is not None:
+        kwargs["download_root"] = download_root
+
+    return load_fn(name, **kwargs)
+
+
+def _map_timestamped_segments(raw_segments: Iterable[Dict[str, Any]]) -> tuple[List[TranscriptionSegment], List[TranscriptionWord]]:
+    """Convert whisper-timestamped segments into dataclass-friendly structures."""
+
+    segments: List[TranscriptionSegment] = []
+    words: List[TranscriptionWord] = []
+
+    for raw_segment in raw_segments:
+        raw_words = raw_segment.get("words") or []
+        segment_words: List[TranscriptionWord] = []
+        for raw_word in raw_words:
+            word = TranscriptionWord(
+                start=_safe_float(raw_word.get("start")) or 0.0,
+                end=_safe_float(raw_word.get("end")) or 0.0,
+                text=str(raw_word.get("text", "")),
+                confidence=(
+                    _safe_float(
+                        raw_word.get("confidence", raw_word.get("probability"))
+                    )
+                ),
+            )
+            segment_words.append(word)
+            words.append(word)
+
+        segment = TranscriptionSegment(
+            start=_safe_float(raw_segment.get("start")) or 0.0,
+            end=_safe_float(raw_segment.get("end")) or 0.0,
+            text=str(raw_segment.get("text", "")).strip(),
+            confidence=_safe_float(raw_segment.get("confidence")),
+            avg_logprob=_safe_float(raw_segment.get("avg_logprob")),
+            compression_ratio=_safe_float(raw_segment.get("compression_ratio")),
+            no_speech_prob=_safe_float(raw_segment.get("no_speech_prob")),
+            words=segment_words or None,
+        )
+        segments.append(segment)
+
+    return segments, words
+
+
+def _transcribe_with_timestamped(
+    audio_input: Union[str, np.ndarray],
+    *,
+    language: Optional[str],
+    beam_size: int,
+    temperature: float,
+    vad_filter: bool,
+    compression_ratio_threshold: float,
+    log_prob_threshold: float,
+    no_speech_threshold: float,
+    condition_on_previous_text: bool,
+    timestamped_model: Optional[Any],
+    timestamped_model_name: Optional[str],
+    timestamped_device: Optional[str],
+    timestamped_options: Optional[Dict[str, Any]],
+) -> TranscriptionResult:
+    """Run whisper-timestamped and map the response into ``TranscriptionResult``."""
+
+    if not HAS_WHISPER_TIMESTAMPED:
+        raise ImportError(
+            "Режим поминутной разбивки по словам требует whisper-timestamped и openai-whisper."
+        )
+
+    try:
+        transcribe_fn = getattr(whisper_timestamped, "transcribe_timestamped")  # type: ignore[attr-defined]
+    except AttributeError as exc:  # pragma: no cover - optional dependency
+        raise ImportError(
+            "Функция transcribe_timestamped недоступна в установленной версии whisper-timestamped."
+        ) from exc
+
+    active_model = timestamped_model
+    if active_model is None:
+        if not timestamped_model_name:
+            raise ValueError(
+                "Не указан параметр timestamped_model_name для режима word-level."
+            )
+        active_model = load_word_level_model(
+            timestamped_model_name,
+            device=timestamped_device,
+        )
+
+    kwargs: Dict[str, Any] = {
+        "language": language,
+        "beam_size": beam_size,
+        "temperature": temperature,
+        "compression_ratio_threshold": compression_ratio_threshold,
+        "logprob_threshold": log_prob_threshold,
+        "no_speech_threshold": no_speech_threshold,
+        "condition_on_previous_text": condition_on_previous_text,
+        "vad": vad_filter,
+    }
+
+    if timestamped_options:
+        kwargs.update(timestamped_options)
+
+    # Remove ``None`` values so that whisper-timestamped can fall back to defaults.
+    clean_kwargs = {key: value for key, value in kwargs.items() if value is not None}
+
+    raw_result = transcribe_fn(active_model, audio_input, **clean_kwargs)
+
+    raw_segments = raw_result.get("segments") or []
+    segments, words = _map_timestamped_segments(raw_segments)
+
+    duration = _safe_float(raw_result.get("duration"))
+    if (duration is None) and segments:
+        duration = max((segment.end for segment in segments), default=0.0)
+    duration = duration or 0.0
+
+    text = str(raw_result.get("text", "")).strip()
+    language_code = raw_result.get("language")
+
+    confidence_metrics = _compute_confidence_metrics(words)
+
+    return TranscriptionResult(
+        text=text,
+        segments=segments,
+        duration=duration,
+        language=str(language_code) if language_code else None,
+        words=words or None,
+        word_confidence=confidence_metrics,
+    )
 
 
 def _calculate_overlap(previous: str, current: str, *, max_overlap_chars: int = 160) -> int:
@@ -382,6 +598,11 @@ def transcribe_audio(
     log_prob_threshold: float = -1.0,
     no_speech_threshold: float = 0.6,
     condition_on_previous_text: bool = True,
+    word_level: bool = False,
+    timestamped_model: Optional[Any] = None,
+    timestamped_model_name: Optional[str] = None,
+    timestamped_device: Optional[str] = None,
+    timestamped_options: Optional[Dict[str, Any]] = None,
 ) -> TranscriptionResult:
     """Transcribe an audio file and aggregate the model output."""
 
@@ -389,6 +610,23 @@ def transcribe_audio(
         audio_input: Union[str, np.ndarray] = str(audio_source)
     else:
         audio_input = audio_source
+
+    if word_level:
+        return _transcribe_with_timestamped(
+            audio_input,
+            language=language,
+            beam_size=beam_size,
+            temperature=temperature,
+            vad_filter=vad_filter,
+            compression_ratio_threshold=compression_ratio_threshold,
+            log_prob_threshold=log_prob_threshold,
+            no_speech_threshold=no_speech_threshold,
+            condition_on_previous_text=condition_on_previous_text,
+            timestamped_model=timestamped_model,
+            timestamped_model_name=timestamped_model_name,
+            timestamped_device=timestamped_device,
+            timestamped_options=timestamped_options,
+        )
 
     segment_iter, info = model.transcribe(
         audio_input,
@@ -418,6 +656,10 @@ def transcribe_audio(
                 start=segment.start,
                 end=segment.end,
                 text=text,
+                confidence=getattr(segment, "confidence", None),
+                avg_logprob=getattr(segment, "avg_logprob", None),
+                compression_ratio=getattr(segment, "compression_ratio", None),
+                no_speech_prob=getattr(segment, "no_speech_prob", None),
             )
         )
         if text:
