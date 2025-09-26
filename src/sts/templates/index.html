@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>STS - Транскрибация в реальном времени</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        
+        .header p {
+            font-size: 1.2em;
+            opacity: 0.9;
+        }
+        
+        .controls {
+            padding: 30px;
+            background: #f8f9fa;
+            border-bottom: 1px solid #e9ecef;
+        }
+        
+        .control-group {
+            display: flex;
+            gap: 20px;
+            align-items: center;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+        
+        .control-group label {
+            font-weight: 600;
+            color: #495057;
+            min-width: 100px;
+        }
+        
+        select, button {
+            padding: 12px 20px;
+            border: 2px solid #dee2e6;
+            border-radius: 10px;
+            font-size: 16px;
+            transition: all 0.3s ease;
+        }
+        
+        select:focus, button:focus {
+            outline: none;
+            border-color: #4facfe;
+            box-shadow: 0 0 0 3px rgba(79, 172, 254, 0.1);
+        }
+        
+        .btn-primary {
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            color: white;
+            border: none;
+            cursor: pointer;
+            font-weight: 600;
+        }
+        
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(79, 172, 254, 0.3);
+        }
+        
+        .btn-danger {
+            background: linear-gradient(135deg, #ff6b6b 0%, #ee5a52 100%);
+            color: white;
+            border: none;
+            cursor: pointer;
+            font-weight: 600;
+        }
+        
+        .btn-secondary {
+            background: #6c757d;
+            color: white;
+            border: none;
+            cursor: pointer;
+        }
+        
+        .status {
+            padding: 15px 30px;
+            background: #e3f2fd;
+            border-left: 4px solid #2196f3;
+            margin: 20px 30px;
+            border-radius: 5px;
+            display: none;
+        }
+        
+        .status.show {
+            display: block;
+        }
+        
+        .status.error {
+            background: #ffebee;
+            border-color: #f44336;
+            color: #c62828;
+        }
+        
+        .status.success {
+            background: #e8f5e8;
+            border-color: #4caf50;
+            color: #2e7d32;
+        }
+        
+        .transcript-area {
+            padding: 30px;
+            min-height: 400px;
+        }
+        
+        .transcript-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        
+        .transcript-header h2 {
+            color: #495057;
+        }
+        
+        .transcript-content {
+            background: #f8f9fa;
+            border: 2px dashed #dee2e6;
+            border-radius: 10px;
+            padding: 30px;
+            min-height: 300px;
+            font-size: 18px;
+            line-height: 1.6;
+            color: #495057;
+        }
+        
+        .transcript-content.active {
+            border-color: #4facfe;
+            background: #f0f8ff;
+        }
+        
+        .transcript-segment {
+            margin-bottom: 15px;
+            padding: 15px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            animation: fadeIn 0.5s ease-in;
+        }
+        
+        .transcript-segment .meta {
+            font-size: 12px;
+            color: #6c757d;
+            margin-bottom: 5px;
+        }
+        
+        .transcript-segment .text {
+            font-size: 16px;
+            color: #212529;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .continuous-transcript {
+            font-size: 18px;
+            line-height: 1.8;
+            color: #212529;
+            padding: 20px;
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        
+        .new-word {
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            color: white;
+            padding: 2px 4px;
+            border-radius: 4px;
+            animation: highlightFade 2s ease-out;
+        }
+        
+        @keyframes highlightFade {
+            0% { 
+                background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+                transform: scale(1.05);
+            }
+            100% { 
+                background: transparent;
+                color: #212529;
+                transform: scale(1);
+            }
+        }
+        
+        .recording-indicator {
+            display: none;
+            align-items: center;
+            gap: 10px;
+            color: #dc3545;
+            font-weight: 600;
+        }
+        
+        .recording-indicator.active {
+            display: flex;
+        }
+        
+        .recording-dot {
+            width: 12px;
+            height: 12px;
+            background: #dc3545;
+            border-radius: 50%;
+            animation: pulse 1s infinite;
+        }
+        
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+        
+        .empty-state {
+            text-align: center;
+            color: #6c757d;
+            font-style: italic;
+        }
+        
+        @media (max-width: 768px) {
+            .control-group {
+                flex-direction: column;
+                align-items: stretch;
+            }
+            
+            .control-group label {
+                min-width: auto;
+            }
+            
+            .transcript-header {
+                flex-direction: column;
+                gap: 15px;
+                align-items: stretch;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🎤 STS Transcription</h1>
+            <p>Транскрибация речи в реальном времени</p>
+        </div>
+        
+        <div class="controls">
+            <div class="control-group">
+                <label for="model-select">Модель:</label>
+                <select id="model-select">
+                    <option value="small">Small (рекомендуемая)</option>
+                </select>
+                
+                <label for="language-select">Язык:</label>
+                <select id="language-select">
+                    <option value="auto">Автоматическое определение</option>
+                </select>
+                
+                <label for="speed-select">Скорость:</label>
+                <select id="speed-select">
+                    <option value="instant">🚀 БЫСТРО (1.5с) - качественно</option>
+                    <option value="lightning">⚡ СТАБИЛЬНО (2с) - рекомендуется</option>
+                    <option value="fast">🏃 НАДЕЖНО (2.5с)</option>
+                    <option value="quality">🎯 МАКСИМУМ (4с)</option>
+                </select>
+                
+                <label for="display-mode">Режим:</label>
+                <select id="display-mode">
+                    <option value="continuous">Непрерывный текст</option>
+                    <option value="segments">Отдельные сегменты</option>
+                </select>
+            </div>
+            
+            <div class="control-group">
+                <button id="start-btn" class="btn-primary">▶️ Начать транскрибацию</button>
+                <button id="stop-btn" class="btn-danger" style="display: none;">⏹️ Остановить</button>
+                <button id="clear-btn" class="btn-secondary">🗑️ Очистить</button>
+                
+                <div class="recording-indicator" id="recording-indicator">
+                    <div class="recording-dot"></div>
+                    <span>Запись активна</span>
+                </div>
+            </div>
+        </div>
+        
+        <div class="status" id="status"></div>
+        
+        <div class="transcript-area">
+            <div class="transcript-header">
+                <h2>📝 Транскрибация</h2>
+                <button id="copy-btn" class="btn-secondary" style="display: none;">📋 Копировать текст</button>
+            </div>
+            
+            <div class="transcript-content" id="transcript-content">
+                <div class="empty-state">
+                    Нажмите "Начать транскрибацию" для начала работы.<br>
+                    Убедитесь, что в системных настройках выбран Multi-Output Device.
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const socket = io();
+        const startBtn = document.getElementById('start-btn');
+        const stopBtn = document.getElementById('stop-btn');
+        const clearBtn = document.getElementById('clear-btn');
+        const copyBtn = document.getElementById('copy-btn');
+        const modelSelect = document.getElementById('model-select');
+        const languageSelect = document.getElementById('language-select');
+        const speedSelect = document.getElementById('speed-select');
+        const displayModeSelect = document.getElementById('display-mode');
+        const status = document.getElementById('status');
+        const transcriptContent = document.getElementById('transcript-content');
+        const recordingIndicator = document.getElementById('recording-indicator');
+        
+        let isRecording = false;
+        let allTranscripts = [];
+        
+        // Загрузка доступных моделей и языков
+        fetch('/api/models')
+            .then(response => response.json())
+            .then(models => {
+                modelSelect.innerHTML = '';
+                models.forEach(model => {
+                    const option = document.createElement('option');
+                    option.value = model.id;
+                    option.textContent = `${model.name} - ${model.size}`;
+                    if (model.id === 'small') option.selected = true;
+                    modelSelect.appendChild(option);
+                });
+            });
+        
+        fetch('/api/languages')
+            .then(response => response.json())
+            .then(languages => {
+                languageSelect.innerHTML = '';
+                languages.forEach(lang => {
+                    const option = document.createElement('option');
+                    option.value = lang.code;
+                    option.textContent = lang.name;
+                    languageSelect.appendChild(option);
+                });
+            });
+        
+        // Обработчики событий
+        startBtn.addEventListener('click', () => {
+            if (!isRecording) {
+                socket.emit('start_transcription', {
+                    model: modelSelect.value,
+                    language: languageSelect.value,
+                    speed: speedSelect.value
+                });
+            }
+        });
+        
+        stopBtn.addEventListener('click', () => {
+            if (isRecording) {
+                socket.emit('stop_transcription');
+            }
+        });
+        
+        clearBtn.addEventListener('click', () => {
+            socket.emit('clear_transcript');
+        });
+        
+        copyBtn.addEventListener('click', () => {
+            const fullText = allTranscripts.map(t => t.text).join(' ');
+            navigator.clipboard.writeText(fullText).then(() => {
+                showStatus('Текст скопирован в буфер обмена', 'success');
+            });
+        });
+        
+        // Socket.IO события
+        socket.on('status', (data) => {
+            showStatus(data.message, 'info');
+        });
+        
+        socket.on('error', (data) => {
+            showStatus(data.message, 'error');
+        });
+        
+        socket.on('transcription_started', () => {
+            isRecording = true;
+            startBtn.style.display = 'none';
+            stopBtn.style.display = 'inline-block';
+            recordingIndicator.classList.add('active');
+            transcriptContent.classList.add('active');
+            transcriptContent.innerHTML = '<div class="empty-state">Слушаю аудио... Говорите что-нибудь!</div>';
+            showStatus('Транскрибация активна', 'success');
+        });
+        
+        socket.on('transcription_stopped', () => {
+            isRecording = false;
+            startBtn.style.display = 'inline-block';
+            stopBtn.style.display = 'none';
+            recordingIndicator.classList.remove('active');
+            transcriptContent.classList.remove('active');
+            showStatus('Транскрибация остановлена', 'info');
+        });
+        
+        socket.on('transcription_update', (data) => {
+            allTranscripts.push(data.new_segment);
+            
+            if (displayModeSelect.value === 'continuous') {
+                updateContinuousTranscript(data.full_text, data.new_segment);
+            } else {
+                addTranscriptSegment(data.new_segment);
+            }
+            
+            copyBtn.style.display = 'inline-block';
+        });
+        
+        socket.on('transcript_cleared', () => {
+            allTranscripts = [];
+            transcriptContent.innerHTML = '<div class="empty-state">Транскрипция очищена</div>';
+            copyBtn.style.display = 'none';
+        });
+        
+        // Вспомогательные функции
+        function showStatus(message, type = 'info') {
+            status.textContent = message;
+            status.className = `status show ${type}`;
+            setTimeout(() => {
+                status.classList.remove('show');
+            }, 5000);
+        }
+        
+        function updateContinuousTranscript(fullText, newSegment) {
+            if (transcriptContent.querySelector('.empty-state')) {
+                transcriptContent.innerHTML = '';
+            }
+            
+            // Создаем или обновляем единый блок с текстом
+            let continuousBlock = transcriptContent.querySelector('.continuous-transcript');
+            if (!continuousBlock) {
+                continuousBlock = document.createElement('div');
+                continuousBlock.className = 'continuous-transcript';
+                transcriptContent.appendChild(continuousBlock);
+            }
+            
+            // Обновляем текст с подсветкой нового сегмента
+            const words = fullText.split(' ');
+            const newWords = newSegment.text.trim().split(' ');
+            const startIndex = words.length - newWords.length;
+            
+            let html = '';
+            words.forEach((word, index) => {
+                if (index >= startIndex) {
+                    html += `<span class="new-word">${word}</span> `;
+                } else {
+                    html += `${word} `;
+                }
+            });
+            
+            continuousBlock.innerHTML = html;
+            
+            // Убираем подсветку через 2 секунды
+            setTimeout(() => {
+                const newWords = continuousBlock.querySelectorAll('.new-word');
+                newWords.forEach(word => word.classList.remove('new-word'));
+            }, 2000);
+            
+            // Прокрутка вниз
+            transcriptContent.scrollTop = transcriptContent.scrollHeight;
+        }
+        
+        function addTranscriptSegment(data) {
+            if (transcriptContent.querySelector('.empty-state')) {
+                transcriptContent.innerHTML = '';
+            }
+            
+            const segment = document.createElement('div');
+            segment.className = 'transcript-segment';
+            
+            const meta = document.createElement('div');
+            meta.className = 'meta';
+            meta.textContent = `${new Date(data.timestamp * 1000).toLocaleTimeString()} • ${data.language || 'auto'} • ${data.duration.toFixed(1)}s`;
+            
+            const text = document.createElement('div');
+            text.className = 'text';
+            text.textContent = data.text;
+            
+            segment.appendChild(meta);
+            segment.appendChild(text);
+            transcriptContent.appendChild(segment);
+            
+            // Прокрутка вниз
+            transcriptContent.scrollTop = transcriptContent.scrollHeight;
+        }
+    </script>
+</body>
+</html>

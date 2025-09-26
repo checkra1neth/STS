@@ -14,6 +14,21 @@
 
 2. Для записи аудио используется `sounddevice`, которому может потребоваться установка [PortAudio](http://www.portaudio.com/) (на macOS достаточно выполнить `brew install portaudio`).
 
+3. Для работы с видеофайлами требуется [FFmpeg](https://ffmpeg.org/):
+   ```bash
+   # macOS
+   brew install ffmpeg
+   
+   # Ubuntu/Debian
+   sudo apt update && sudo apt install ffmpeg
+   ```
+
+4. Для захвата системного аудио (стримы, браузер) на macOS установите [BlackHole](https://github.com/ExistentialAudio/BlackHole):
+   ```bash
+   brew install blackhole-2ch
+   ```
+   Затем настройте Multi-Output Device в Audio MIDI Setup для одновременного вывода на динамики и BlackHole.
+
 ## Использование
 
 Интерфейс предоставляется через модуль `sts.cli`. Его можно запускать командой:
@@ -25,10 +40,14 @@ python -m sts.cli --help
 ### Расшифровка готового файла
 
 ```bash
+# Аудиофайл
 python -m sts.cli --input path/to/audio.wav --output transcript.txt
+
+# Видеофайл (аудио будет автоматически извлечено)
+python -m sts.cli --input path/to/video.mp4 --language ru --output transcript.txt
 ```
 
-Скрипт автоматически скачает и закеширует модель `distil-small`, которая потребляет значительно меньше ресурсов, но при этом обеспечивает высокое качество распознавания для десятков языков (включая русский и украинский). При необходимости можно выбрать другую модель, например `distil-small.en` (английская сборка), `small` или `medium`, указав флаг `--model`.
+Скрипт автоматически скачает и закеширует модель `small`, которая обеспечивает хорошее качество распознавания для десятков языков (включая русский и украинский). При необходимости можно выбрать другую модель, например `tiny` (быстрая), `base`, `medium` или `large`, указав флаг `--model`. Для английского языка доступны оптимизированные версии с суффиксом `.en` (например, `small.en`).
 
 ### Запись с микрофона в реальном времени
 
@@ -36,15 +55,33 @@ python -m sts.cli --input path/to/audio.wav --output transcript.txt
 python -m sts.cli --record --output transcript.txt
 ```
 
-1. Скрипт начнёт запись с выбранного устройства (по умолчанию используется системный микрофон).
-2. Нажмите `Ctrl+C`, когда захотите остановить запись и перейти к распознаванию.
-3. Результат появится в терминале, а также будет сохранён в файл, если указан флаг `--output`.
-
-Чтобы выбрать конкретное устройство ввода или посмотреть их список, используйте флаги:
+### Захват системного аудио (стримы, браузер, приложения)
 
 ```bash
-python -m sts.cli --record --list-devices
-python -m sts.cli --record --input-device "MacBook Pro Microphone"
+# Захват системного аудио до нажатия Ctrl+C
+python -m sts.cli --system-audio --language ru --output transcript.txt
+
+# Захват на определенное время (30 секунд)
+python -m sts.cli --system-audio --duration 30 --language ru --output transcript.txt
+```
+
+**Как это работает:**
+1. Система автоматически найдет устройство для захвата системного аудио (BlackHole на macOS)
+2. Начнется запись всего аудио, воспроизводимого на компьютере
+3. Нажмите `Ctrl+C` или дождитесь окончания времени для остановки
+4. Результат будет транскрибирован и сохранен
+
+### Управление аудиоустройствами
+
+```bash
+# Посмотреть все доступные устройства (включая системные)
+python -m sts.cli --list-devices
+
+# Выбрать конкретное устройство для записи
+python -m sts.cli --record --input-device "MacBook Pro Microphone" --output transcript.txt
+
+# Выбрать конкретное системное устройство
+python -m sts.cli --system-audio --input-device "BlackHole 2ch" --output transcript.txt
 ```
 
 ### Оптимизация под Mac M1 Pro
@@ -63,4 +100,4 @@ python -m sts.cli --record --input-device "MacBook Pro Microphone"
 
 ## Примечание о модели
 
-При первом запуске выбранная модель Whisper будет скачана и сохранена в кэш директории `~/.cache/faster-whisper`. Убедитесь, что у вас достаточно свободного места (для `distil-small` требуется около 1 ГБ).
+При первом запуске выбранная модель Whisper будет скачана и сохранена в кэш директории `~/.cache/faster-whisper`. Убедитесь, что у вас достаточно свободного места (для `small` требуется около 500 МБ, для `medium` — около 1.5 ГБ).

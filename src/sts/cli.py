@@ -10,7 +10,16 @@ from typing import Optional
 
 import sounddevice as sd
 
-from .transcriber import capture_audio, load_model, transcribe_audio
+from .transcriber import (
+    capture_audio, 
+    load_model, 
+    transcribe_audio, 
+    extract_audio_from_video, 
+    is_video_file,
+    capture_system_audio,
+    find_system_audio_devices,
+    stream_transcribe
+)
 
 
 def _parse_input_device(device: Optional[str]) -> Optional[int | str]:
@@ -29,21 +38,36 @@ def build_parser() -> argparse.ArgumentParser:
             "через оптимизированную сборку Whisper."
         )
     )
-    source_group = parser.add_mutually_exclusive_group(required=True)
+    source_group = parser.add_mutually_exclusive_group(required=False)
     source_group.add_argument(
         "--input",
         type=Path,
-        help="Путь к готовому аудиофайлу (поддерживаются форматы ffmpeg).",
+        help="Путь к аудио- или видеофайлу (поддерживаются форматы ffmpeg).",
     )
     source_group.add_argument(
         "--record",
         action="store_true",
-        help="Записать аудио с выбранного устройства и использовать его для распознавания.",
+        help="Записать аудио с микрофона и использовать его для распознавания.",
+    )
+    source_group.add_argument(
+        "--system-audio",
+        action="store_true",
+        help="Записать системное аудио (стримы, браузер, приложения) для распознавания.",
+    )
+    source_group.add_argument(
+        "--web",
+        action="store_true",
+        help="Запустить веб-интерфейс для транскрибации в реальном времени.",
+    )
+    source_group.add_argument(
+        "--stream",
+        action="store_true",
+        help="Потоковая транскрибация в реальном времени (консольный режим).",
     )
     parser.add_argument(
         "--model",
-        default="distil-small",
-        help="Размер модели Whisper. distil-small — оптимальный баланс качества и скорости для CPU и поддерживает многие языки.",
+        default="small",
+        help="Размер модели Whisper. small — оптимальный баланс качества и скорости для CPU и поддерживает многие языки.",
     )
     parser.add_argument(
         "--device",
@@ -85,6 +109,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Вывести список доступных аудиоустройств и завершить работу.",
     )
     parser.add_argument(
+        "--duration",
+        type=float,
+        default=None,
+        help="Длительность записи в секундах (только для --system-audio). Если не указано, запись до Ctrl+C.",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=None,
@@ -118,28 +148,65 @@ def build_parser() -> argparse.ArgumentParser:
 def _maybe_list_devices(list_requested: bool) -> None:
     if not list_requested:
         return
+    
+    print("=== Все аудиоустройства ===")
     print(sd.query_devices())
+    
+    print("\n=== Системные аудиоустройства (для захвата стримов) ===")
+    system_devices = find_system_audio_devices()
+    if system_devices:
+        for device in system_devices:
+            print(f"[{device['index']}] {device['name']} ({device['channels']} каналов)")
+    else:
+        print("Системные аудиоустройства не найдены.")
+        print("Для macOS установите BlackHole: brew install blackhole-2ch")
+    
     raise SystemExit(0)
 
 
-def _resolve_input_file(args: argparse.Namespace) -> Path:
+def _resolve_input_file(args: argparse.Namespace) -> tuple[Path, bool]:
+    """Resolve input file and return (path, is_temp_file)."""
     if args.input:
         path = args.input.expanduser().resolve()
         if not path.exists():
-            raise FileNotFoundError(f"Аудиофайл не найден: {path}")
-        return path
+            raise FileNotFoundError(f"Файл не найден: {path}")
+        
+        # Если это видеофайл, извлекаем аудио
+        if is_video_file(path):
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            tmp_path = Path(tmp.name)
+            tmp.close()
+            extract_audio_from_video(path, tmp_path, args.samplerate)
+            return tmp_path, True
+        
+        return path, False
 
-    assert args.record
+    # Запись с микрофона или системного аудио
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     tmp_path = Path(tmp.name)
     tmp.close()
-    capture_audio(
-        tmp_path,
-        samplerate=args.samplerate,
-        channels=args.channels,
-        device=_parse_input_device(args.input_device),
-    )
-    return tmp_path
+    
+    if args.system_audio:
+        # Системное аудио обычно стерео
+        channels = 2 if args.channels == 1 else args.channels
+        capture_system_audio(
+            tmp_path,
+            samplerate=args.samplerate,
+            channels=channels,
+            device=_parse_input_device(args.input_device),
+            duration=args.duration,
+        )
+    else:
+        # Обычная запись с микрофона
+        assert args.record
+        capture_audio(
+            tmp_path,
+            samplerate=args.samplerate,
+            channels=args.channels,
+            device=_parse_input_device(args.input_device),
+        )
+    
+    return tmp_path, True
 
 
 def main(argv: Optional[list[str]] = None) -> None:
@@ -147,8 +214,59 @@ def main(argv: Optional[list[str]] = None) -> None:
     args = parser.parse_args(argv)
 
     _maybe_list_devices(args.list_devices)
+    
+    # Проверяем, что выбран один из источников
+    if not any([args.input, args.record, args.system_audio, args.web, args.stream]):
+        parser.error("Необходимо выбрать один из: --input, --record, --system-audio, --web, или --stream")
+    
+    # Запуск веб-интерфейса
+    if args.web:
+        from .web_app import run_web_app
+        run_web_app(host='127.0.0.1', port=8080, debug=False)
+        return
+    
+    # Потоковая транскрибация
+    if args.stream:
+        requested_language = args.language.lower() if args.language else None
+        model_name = args.model
+
+        if requested_language and requested_language != "en" and model_name.endswith(".en"):
+            multilingual_candidate = model_name[: -len(".en")]
+            if multilingual_candidate:
+                print(
+                    "Выбранная модель поддерживает только английский. Для распознавания языка "
+                    f"'{requested_language}' автоматически использую '{multilingual_candidate}'.",
+                    file=sys.stderr,
+                )
+                model_name = multilingual_candidate
+
+        model = load_model(
+            model_name,
+            device=args.device,
+            compute_type=args.compute_type,
+            cpu_threads=args.cpu_threads,
+        )
+
+        def print_result(result):
+            print(f"[{result['language']}] {result['text']}")
+            if args.output:
+                with open(args.output, 'a', encoding='utf-8') as f:
+                    f.write(f"{result['text']} ")
+
+        # Используем минимальную задержку для консольной версии
+        chunk_duration = 0.8 if args.model == 'tiny' else 1.5
+        
+        stream_transcribe(
+            model=model,
+            device=_parse_input_device(args.input_device),
+            language=requested_language,
+            chunk_duration=chunk_duration,  # Адаптивная задержка
+            callback=print_result
+        )
+        return
 
     audio_path: Optional[Path] = None
+    is_temp_file = False
     requested_language = args.language.lower() if args.language else None
     model_name = args.model
 
@@ -163,13 +281,13 @@ def main(argv: Optional[list[str]] = None) -> None:
             model_name = multilingual_candidate
         else:
             print(
-                "Выбранная модель поддерживает только английский. Укажите многоязычную модель (например, distil-small).",
+                "Выбранная модель поддерживает только английский. Укажите многоязычную модель (например, small).",
                 file=sys.stderr,
             )
             raise SystemExit(1)
 
     try:
-        audio_path = _resolve_input_file(args)
+        audio_path, is_temp_file = _resolve_input_file(args)
 
         model = load_model(
             model_name,
@@ -180,7 +298,7 @@ def main(argv: Optional[list[str]] = None) -> None:
 
         if requested_language and requested_language != "en" and not getattr(model, "is_multilingual", True):
             print(
-                "Загруженная модель поддерживает только английский язык. Выберите многоязычную модель (например, distil-small).",
+                "Загруженная модель поддерживает только английский язык. Выберите многоязычную модель (например, small).",
                 file=sys.stderr,
             )
             raise SystemExit(1)
@@ -211,7 +329,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             args.output.write_text(result.text, encoding="utf-8")
             print(f"\nТранскрипция сохранена в {args.output}")
     finally:
-        if args.record and audio_path and audio_path.exists():
+        if is_temp_file and audio_path and audio_path.exists():
             audio_path.unlink()
 
 

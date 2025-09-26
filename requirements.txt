@@ -2,3 +2,7 @@ faster-whisper>=0.10.0
 sounddevice>=0.4.6
 soundfile>=0.12.1
 numpy>=1.23
+ffmpeg-python>=0.2.0
+flask>=2.3.0
+flask-socketio>=5.3.0
+python-socketio>=5.8.0
