@@ -9,12 +9,20 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Deque, List, Optional, Sequence, Set, Union
+from typing import Deque, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
 from faster_whisper import WhisperModel
+
+try:
+    from whisper_timestamped import stabilize_timestamps as whisper_stabilize_timestamps  # type: ignore
+
+    HAS_WHISPER_STABILIZER = True
+except (ImportError, AttributeError):
+    whisper_stabilize_timestamps = None  # type: ignore[assignment]
+    HAS_WHISPER_STABILIZER = False
 
 try:
     import ffmpeg
@@ -35,6 +43,8 @@ class StreamProfile:
     temperature: float
     use_threading: bool
     cpu_threads: Optional[int]
+    stabilize_stream: bool = False
+    stabilize_confirmation_window: int = 2
 
 
 BEST_STREAM_PROFILE = StreamProfile(
@@ -46,6 +56,8 @@ BEST_STREAM_PROFILE = StreamProfile(
     temperature=0.0,
     use_threading=True,
     cpu_threads=4,
+    stabilize_stream=False,
+    stabilize_confirmation_window=2,
 )
 
 
@@ -56,6 +68,21 @@ class TranscriptionSegment:
     start: float
     end: float
     text: str
+    words: List["WordTiming"]
+
+
+@dataclass
+class WordTiming:
+    """Word-level timing information for stabilized streaming output."""
+
+    text: str
+    start: float
+    end: float
+    probability: Optional[float] = None
+
+    @property
+    def normalized(self) -> str:
+        return self.text.strip()
 
 
 @dataclass
@@ -382,6 +409,7 @@ def transcribe_audio(
     log_prob_threshold: float = -1.0,
     no_speech_threshold: float = 0.6,
     condition_on_previous_text: bool = True,
+    word_timestamps: bool = False,
 ) -> TranscriptionResult:
     """Transcribe an audio file and aggregate the model output."""
 
@@ -400,6 +428,7 @@ def transcribe_audio(
         log_prob_threshold=log_prob_threshold,
         no_speech_threshold=no_speech_threshold,
         condition_on_previous_text=condition_on_previous_text,
+        word_timestamps=word_timestamps,
     )
 
     collected: List[TranscriptionSegment] = []
@@ -413,11 +442,28 @@ def transcribe_audio(
             if overlap:
                 text = text[overlap:].lstrip()
 
+        word_timings: List[WordTiming] = []
+        if word_timestamps:
+            for word in getattr(segment, "words", []) or []:
+                word_text = getattr(word, "word", "")
+                word_start = float(getattr(word, "start", segment.start) or 0.0)
+                word_end = float(getattr(word, "end", word_start))
+                probability = getattr(word, "probability", None)
+                word_timings.append(
+                    WordTiming(
+                        text=word_text,
+                        start=word_start,
+                        end=word_end if word_end >= word_start else word_start,
+                        probability=probability,
+                    )
+                )
+
         collected.append(
             TranscriptionSegment(
                 start=segment.start,
                 end=segment.end,
                 text=text,
+                words=word_timings,
             )
         )
         if text:
@@ -592,11 +638,17 @@ class StreamTranscriber:
         self.silence_threshold = 0.0015
         self._emitted_history: Deque[str] = deque(maxlen=12)
         self._cumulative_text = ""
+        self._stabilize_stream = False
+        self._confirmation_window = 1
+        self._word_history: Deque[List[WordTiming]] = deque()
+        self._confirmed_tokens: List[WordTiming] = []
+        self._stabilizer_warning_emitted = False
 
     def start(self, model: WhisperModel, device: Optional[int | str] = None,
               samplerate: int = 16_000, channels: int = 2, chunk_duration: float = 5.0,
               language: Optional[str] = None, beam_size: int = 5, vad_filter: bool = True,
               overlap_ratio: float = 0.25, temperature: float = 0.0,
+              stabilize_stream: bool = False, confirmation_window: int = 2,
               use_threading: bool = True, callback=None):
         """Start streaming transcription."""
 
@@ -619,6 +671,18 @@ class StreamTranscriber:
         self.recording = True
         self._emitted_history.clear()
         self._cumulative_text = ""
+        self._confirmation_window = max(1, int(confirmation_window))
+        self._stabilize_stream = bool(stabilize_stream)
+        self._word_history = deque(maxlen=self._confirmation_window)
+        self._confirmed_tokens = []
+        self._stabilizer_warning_emitted = False
+
+        if self._stabilize_stream and not HAS_WHISPER_STABILIZER:
+            print(
+                "whisper-timestamped не найден. Использую простую стабилизацию таймкодов.",
+                file=sys.stderr,
+            )
+            self._stabilizer_warning_emitted = True
 
         # Создаем пул потоков для обработки
         import concurrent.futures
@@ -632,6 +696,29 @@ class StreamTranscriber:
         
         min_chunk_duration = max(chunk_duration, 0.4)
         target_chunk_samples = max(int(min_chunk_duration * samplerate), samplerate // 2)
+
+        def emit_result(result: TranscriptionResult, emitted_time: float) -> None:
+            if not callback or not self.recording:
+                return
+
+            if self._stabilize_stream:
+                addition, confirmed_tokens = self._handle_stabilized_output(result)
+            else:
+                addition = _merge_with_history(result.text, self._emitted_history)
+                confirmed_tokens: List[WordTiming] = []
+
+            if not addition:
+                return
+
+            self._cumulative_text = f"{self._cumulative_text} {addition}".strip()
+            payload = {
+                'text': addition,
+                'language': result.language,
+                'timestamp': emitted_time,
+                'duration': result.duration,
+                'words': self._tokens_to_payload(confirmed_tokens),
+            }
+            callback(payload)
 
         def process_audio_chunks():
             """Process audio chunks in separate thread."""
@@ -679,18 +766,10 @@ class StreamTranscriber:
                                         vad_filter=vad_filter,
                                         compression_ratio_threshold=1.8,
                                         condition_on_previous_text=False,
+                                        word_timestamps=self._stabilize_stream,
                                     )
 
-                                    addition = _merge_with_history(result.text, self._emitted_history)
-
-                                    if callback and addition and self.recording:
-                                        self._cumulative_text = f"{self._cumulative_text} {addition}".strip()
-                                        callback({
-                                            'text': addition,
-                                            'language': result.language,
-                                            'timestamp': emitted_time,
-                                            'duration': result.duration,
-                                        })
+                                    emit_result(result, emitted_time)
 
                                 except Exception as e:
                                     if self.recording:
@@ -747,18 +826,10 @@ class StreamTranscriber:
                             vad_filter=vad_filter,
                             compression_ratio_threshold=1.8,
                             condition_on_previous_text=False,
+                            word_timestamps=self._stabilize_stream,
                         )
 
-                        addition = _merge_with_history(result.text, self._emitted_history)
-
-                        if callback and addition:
-                            self._cumulative_text = f"{self._cumulative_text} {addition}".strip()
-                            callback({
-                                'text': addition,
-                                'language': result.language,
-                                'timestamp': time.time(),
-                                'duration': result.duration,
-                            })
+                        emit_result(result, time.time())
 
                     except Exception as e:
                         print(f"Ошибка: {e}")
@@ -785,11 +856,235 @@ class StreamTranscriber:
             )
             self.audio_stream.start()
             return True
-            
+
         except Exception as e:
             print(f"Ошибка запуска аудиопотока: {e}")
             self.recording = False
             return False
+
+    def _handle_stabilized_output(self, result: TranscriptionResult) -> Tuple[str, List[WordTiming]]:
+        tokens = self._collect_word_tokens(result)
+        if not tokens:
+            if not self._stabilizer_warning_emitted:
+                print(
+                    "Модель не вернула пометки слов для стабилизации. Возвращаю текст без таймкодов.",
+                    file=sys.stderr,
+                )
+                self._stabilizer_warning_emitted = True
+            return "", []
+
+        stabilized_tokens = self._stabilize_tokens(tokens)
+        self._word_history.append(stabilized_tokens)
+
+        if len(self._word_history) < self._confirmation_window:
+            return "", []
+
+        new_tokens, stable_prefix = self._extract_confirmed_tokens()
+        if not new_tokens:
+            return "", []
+
+        addition_candidate = " ".join(token.normalized for token in new_tokens if token.normalized)
+        if not addition_candidate:
+            addition_candidate = self._tokens_to_text(new_tokens)
+
+        merged_text = _merge_with_history(addition_candidate, self._emitted_history)
+        if not merged_text:
+            return "", []
+
+        matched_tokens = self._match_tokens_to_text(new_tokens, merged_text)
+        if matched_tokens:
+            self._confirmed_tokens = stable_prefix
+            final_text = self._tokens_to_text(matched_tokens)
+            return final_text or merged_text, matched_tokens
+
+        # Если по какой-то причине сопоставление не удалось, не обновляем подтверждённые токены.
+        return "", []
+
+    def _collect_word_tokens(self, result: TranscriptionResult) -> List[WordTiming]:
+        collected: List[WordTiming] = []
+        for segment in result.segments:
+            for word in segment.words:
+                collected.append(
+                    WordTiming(
+                        text=word.text,
+                        start=float(word.start),
+                        end=float(word.end),
+                        probability=word.probability,
+                    )
+                )
+        return collected
+
+    def _stabilize_tokens(self, tokens: List[WordTiming]) -> List[WordTiming]:
+        if not tokens:
+            return []
+
+        if HAS_WHISPER_STABILIZER and whisper_stabilize_timestamps:
+            try:
+                payload = [
+                    {
+                        'text': token.text,
+                        'start': float(token.start),
+                        'end': float(token.end),
+                        'probability': token.probability,
+                    }
+                    for token in tokens
+                ]
+                stabilized = whisper_stabilize_timestamps(payload)  # type: ignore[misc]
+                stabilized_tokens: List[WordTiming] = []
+                for item in stabilized:
+                    text_value = item.get('text') or item.get('word') or ""
+                    stabilized_tokens.append(
+                        WordTiming(
+                            text=text_value,
+                            start=float(item.get('start', 0.0)),
+                            end=float(item.get('end', 0.0)),
+                            probability=item.get('probability'),
+                        )
+                    )
+                if stabilized_tokens:
+                    return self._ensure_monotonic(stabilized_tokens)
+            except Exception as exc:  # pragma: no cover - защита от несовместимых версий
+                if not self._stabilizer_warning_emitted:
+                    print(
+                        f"Не удалось использовать whisper-timestamped: {exc}. Переключаюсь на простую стабилизацию.",
+                        file=sys.stderr,
+                    )
+                    self._stabilizer_warning_emitted = True
+
+        return self._ensure_monotonic(tokens)
+
+    def _ensure_monotonic(self, tokens: List[WordTiming]) -> List[WordTiming]:
+        stabilized: List[WordTiming] = []
+        previous_end = 0.0
+        minimum_duration = 0.01
+
+        for token in tokens:
+            start = float(token.start)
+            end = float(token.end)
+
+            if start < previous_end:
+                start = previous_end
+            if end < start + minimum_duration:
+                end = start + minimum_duration
+
+            stabilized.append(
+                WordTiming(
+                    text=token.text,
+                    start=start,
+                    end=end,
+                    probability=token.probability,
+                )
+            )
+            previous_end = end
+
+        return stabilized
+
+    def _extract_confirmed_tokens(self) -> Tuple[List[WordTiming], List[WordTiming]]:
+        stable_prefix = self._ensure_monotonic(self._stable_prefix(list(self._word_history)))
+        confirmed_len = len(self._confirmed_tokens)
+        if len(stable_prefix) <= confirmed_len:
+            return [], self._confirmed_tokens
+
+        new_tokens = stable_prefix[confirmed_len:]
+        return new_tokens, stable_prefix
+
+    def _stable_prefix(self, sequences: Sequence[List[WordTiming]]) -> List[WordTiming]:
+        if not sequences:
+            return []
+
+        min_length = min(len(seq) for seq in sequences)
+        prefix: List[WordTiming] = []
+
+        for index in range(min_length):
+            items = [seq[index] for seq in sequences]
+            reference = items[0]
+            if not all(self._tokens_equivalent(reference, candidate) for candidate in items[1:]):
+                break
+
+            average_start = self._mean([token.start for token in items])
+            average_end = self._mean([token.end for token in items])
+            average_probability = self._mean_optional([token.probability for token in items])
+
+            prefix.append(
+                WordTiming(
+                    text=reference.text,
+                    start=average_start,
+                    end=average_end if average_end >= average_start else average_start,
+                    probability=average_probability,
+                )
+            )
+
+        return prefix
+
+    def _tokens_equivalent(self, first: WordTiming, second: WordTiming) -> bool:
+        return first.normalized.lower() == second.normalized.lower()
+
+    def _mean(self, values: Sequence[float]) -> float:
+        if not values:
+            return 0.0
+        return float(sum(values) / len(values))
+
+    def _mean_optional(self, values: Sequence[Optional[float]]) -> Optional[float]:
+        filtered = [value for value in values if value is not None]
+        if not filtered:
+            return None
+        return float(sum(filtered) / len(filtered))
+
+    def _match_tokens_to_text(self, tokens: Sequence[WordTiming], merged_text: str) -> List[WordTiming]:
+        if not tokens:
+            return []
+
+        merged_words = [part.strip() for part in merged_text.split() if part.strip()]
+        if not merged_words:
+            return list(tokens)
+
+        matched: List[WordTiming] = []
+        pointer = 0
+
+        for token in tokens:
+            normalized = token.normalized
+            if not normalized:
+                continue
+
+            if pointer < len(merged_words) and normalized.lower() == merged_words[pointer].lower():
+                matched.append(token)
+                pointer += 1
+
+            if pointer >= len(merged_words):
+                break
+
+        if not matched:
+            return list(tokens)
+
+        return matched
+
+    def _tokens_to_text(self, tokens: Sequence[WordTiming]) -> str:
+        if not tokens:
+            return ""
+
+        parts: List[str] = []
+        for index, token in enumerate(tokens):
+            piece = token.text
+            if index == 0:
+                piece = piece.lstrip()
+            parts.append(piece)
+
+        return "".join(parts).strip()
+
+    def _tokens_to_payload(self, tokens: Sequence[WordTiming]) -> List[dict]:
+        payload: List[dict] = []
+        for token in tokens:
+            text_value = token.normalized or token.text.strip() or token.text
+            entry = {
+                'text': text_value,
+                'start': float(token.start),
+                'end': float(token.end),
+            }
+            if token.probability is not None:
+                entry['probability'] = float(token.probability)
+            payload.append(entry)
+
+        return payload
     
     def stop(self):
         """Stop streaming transcription."""
@@ -847,6 +1142,8 @@ def stream_transcribe(
         vad_filter=active_profile.vad_filter,
         overlap_ratio=active_profile.overlap_ratio,
         temperature=active_profile.temperature,
+        stabilize_stream=active_profile.stabilize_stream,
+        confirmation_window=active_profile.stabilize_confirmation_window,
         use_threading=active_profile.use_threading,
         callback=callback,
     ):
