@@ -71,7 +71,7 @@ def capture_audio(
 
 
 def load_model(
-    model_size: str = "distil-small.en",
+    model_size: str = "distil-small",
     *,
     device: str = "cpu",
     compute_type: str = "int8",

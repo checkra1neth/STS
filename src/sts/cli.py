@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -41,8 +42,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--model",
-        default="distil-small.en",
-        help="Размер модели Whisper. distil-small.en — оптимальный баланс качества и скорости для CPU.",
+        default="distil-small",
+        help="Размер модели Whisper. distil-small — оптимальный баланс качества и скорости для CPU и поддерживает многие языки.",
     )
     parser.add_argument(
         "--device",
@@ -148,21 +149,47 @@ def main(argv: Optional[list[str]] = None) -> None:
     _maybe_list_devices(args.list_devices)
 
     audio_path: Optional[Path] = None
+    requested_language = args.language.lower() if args.language else None
+    model_name = args.model
+
+    if requested_language and requested_language != "en" and model_name.endswith(".en"):
+        multilingual_candidate = model_name[: -len(".en")]
+        if multilingual_candidate:
+            print(
+                "Выбранная модель поддерживает только английский. Для распознавания языка "
+                f"'{requested_language}' автоматически использую '{multilingual_candidate}'.",
+                file=sys.stderr,
+            )
+            model_name = multilingual_candidate
+        else:
+            print(
+                "Выбранная модель поддерживает только английский. Укажите многоязычную модель (например, distil-small).",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+
     try:
         audio_path = _resolve_input_file(args)
 
         model = load_model(
-            args.model,
+            model_name,
             device=args.device,
             compute_type=args.compute_type,
             cpu_threads=args.cpu_threads,
         )
 
+        if requested_language and requested_language != "en" and not getattr(model, "is_multilingual", True):
+            print(
+                "Загруженная модель поддерживает только английский язык. Выберите многоязычную модель (например, distil-small).",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+
         result = transcribe_audio(
             model,
             audio_path,
             beam_size=args.beam_size,
-            language=args.language,
+            language=requested_language,
             temperature=args.temperature,
             vad_filter=not args.no_vad,
         )
