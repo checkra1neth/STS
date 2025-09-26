@@ -9,7 +9,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Deque, List, Optional, Sequence, Union
+from typing import Deque, List, Optional, Sequence, Set, Union
 
 import numpy as np
 import sounddevice as sd
@@ -263,11 +263,26 @@ def load_model(
     """
 
     if compute_type == "auto":
-        compute_type = _recommend_compute_type(device)
+        recommended = _recommend_compute_type(device)
+        candidate_types: List[str] = [recommended]
+        if recommended != "int8":
+            candidate_types.append("int8")
+    else:
+        candidate_types = [compute_type]
+        if compute_type == "int16":
+            candidate_types.append("int8")
+
+    # Preserve order but avoid duplicate attempts if the fallback matches the
+    # primary configuration.
+    seen: Set[str] = set()
+    unique_candidates = []
+    for candidate in candidate_types:
+        if candidate not in seen:
+            unique_candidates.append(candidate)
+            seen.add(candidate)
 
     kwargs = {
         "device": device,
-        "compute_type": compute_type,
     }
 
     if cpu_threads is not None:
@@ -276,10 +291,39 @@ def load_model(
         # saturating the entire CPU on smaller machines.
         kwargs["num_workers"] = cpu_threads
 
-    return WhisperModel(
-        model_size,
-        **kwargs,
-    )
+    last_error: Optional[Exception] = None
+    for candidate in unique_candidates:
+        try:
+            return WhisperModel(
+                model_size,
+                compute_type=candidate,
+                **kwargs,
+            )
+        except RuntimeError as exc:  # pragma: no cover - depends on backend availability
+            last_error = exc
+            error_message = str(exc).lower()
+            is_int16_failure = "int16" in candidate and "int16" in error_message
+
+            # Fall back only when the backend explicitly complains about int16
+            # support. Otherwise re-raise to avoid hiding real issues.
+            if not is_int16_failure or candidate == unique_candidates[-1]:
+                raise
+
+            print(
+                "⚠️  compute_type='int16' недоступен на данном устройстве. "
+                "Пробую fallback на compute_type='int8'.",
+                file=sys.stderr,
+            )
+            continue
+
+    # Exhausted all candidates without success.
+    if last_error is not None:
+        raise last_error
+
+    # This point should be unreachable because the loop either returns a model
+    # or raises an exception. Raising a RuntimeError provides a clear message if
+    # the invariant is ever broken by future refactoring.
+    raise RuntimeError("Не удалось загрузить модель Whisper: отсутствуют варианты compute_type")
 
 
 def transcribe_audio(
