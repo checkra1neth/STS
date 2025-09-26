@@ -9,7 +9,8 @@ from .transcriber import (
     capture_system_audio,
     find_system_audio_devices,
     stream_transcribe,
-    StreamTranscriber
+    StreamTranscriber,
+    get_best_stream_profile,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "find_system_audio_devices",
     "stream_transcribe",
     "StreamTranscriber",
+    "get_best_stream_profile",
 ]

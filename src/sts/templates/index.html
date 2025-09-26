@@ -131,6 +131,24 @@
             border-color: #4caf50;
             color: #2e7d32;
         }
+
+        .preset-info {
+            padding: 12px 18px;
+            background: rgba(79, 172, 254, 0.12);
+            border: 2px dashed rgba(79, 172, 254, 0.35);
+            border-radius: 12px;
+            font-weight: 600;
+            color: #1b4d83;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .preset-info span {
+            font-size: 14px;
+            font-weight: 500;
+            color: #5c7998;
+        }
         
         .transcript-area {
             padding: 30px;
@@ -289,13 +307,11 @@
                     <option value="auto">Автоматическое определение</option>
                 </select>
                 
-                <label for="speed-select">Скорость:</label>
-                <select id="speed-select">
-                    <option value="instant">🚀 БЫСТРО (1.5с) - качественно</option>
-                    <option value="lightning">⚡ СТАБИЛЬНО (2с) - рекомендуется</option>
-                    <option value="fast">🏃 НАДЕЖНО (2.5с)</option>
-                    <option value="quality">🎯 МАКСИМУМ (4с)</option>
-                </select>
+                <label>Режим:</label>
+                <div class="preset-info">
+                    ⚖️ Баланс скорости и качества
+                    <span>Пакет 2.8с • beam 6 • VAD</span>
+                </div>
                 
                 <label for="display-mode">Режим:</label>
                 <select id="display-mode">
@@ -341,7 +357,6 @@
         const copyBtn = document.getElementById('copy-btn');
         const modelSelect = document.getElementById('model-select');
         const languageSelect = document.getElementById('language-select');
-        const speedSelect = document.getElementById('speed-select');
         const displayModeSelect = document.getElementById('display-mode');
         const status = document.getElementById('status');
         const transcriptContent = document.getElementById('transcript-content');
@@ -382,7 +397,6 @@
                 socket.emit('start_transcription', {
                     model: modelSelect.value,
                     language: languageSelect.value,
-                    speed: speedSelect.value
                 });
             }
         });
