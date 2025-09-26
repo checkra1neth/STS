@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
@@ -146,6 +147,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Отключить VAD-фильтр быстрее-шёпота (по умолчанию включён).",
     )
+    parser.add_argument(
+        "--stabilize-stream",
+        action="store_true",
+        help="Включить стабилизацию слов и таймкодов в потоковом режиме.",
+    )
+    parser.add_argument(
+        "--stabilize-confirmation-window",
+        type=int,
+        default=None,
+        help="Количество гипотез, которые должны совпасть, прежде чем слово будет подтверждено.",
+    )
     return parser
 
 
@@ -244,7 +256,25 @@ def main(argv: Optional[list[str]] = None) -> None:
                 )
                 model_name = multilingual_candidate
 
+        if args.stabilize_confirmation_window is not None and args.stabilize_confirmation_window < 1:
+            print(
+                "Значение --stabilize-confirmation-window должно быть не меньше 1.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+
         profile = get_best_stream_profile()
+        if args.stabilize_stream or args.stabilize_confirmation_window is not None:
+            profile = replace(
+                profile,
+                stabilize_stream=args.stabilize_stream or profile.stabilize_stream,
+                stabilize_confirmation_window=(
+                    args.stabilize_confirmation_window
+                    if args.stabilize_confirmation_window is not None
+                    else profile.stabilize_confirmation_window
+                ),
+            )
+
         cpu_threads = args.cpu_threads if args.cpu_threads is not None else profile.cpu_threads
 
         model = load_model(
@@ -255,7 +285,21 @@ def main(argv: Optional[list[str]] = None) -> None:
         )
 
         def print_result(result):
-            print(f"[{result['language']}] {result['text']}")
+            language = result.get('language') or '--'
+            print(f"[{language}] {result['text']}")
+
+            confirmed_words = result.get('words') or []
+            if confirmed_words:
+                timing_parts = []
+                for word in confirmed_words:
+                    start = word.get('start')
+                    end = word.get('end')
+                    text = word.get('text', '').strip()
+                    if isinstance(start, (int, float)) and isinstance(end, (int, float)) and text:
+                        timing_parts.append(f"{text} ({start:.2f}-{end:.2f})")
+                if timing_parts:
+                    print("   ↳ " + ", ".join(timing_parts))
+
             if args.output:
                 with open(args.output, 'a', encoding='utf-8') as f:
                     f.write(f"{result['text']} ")
