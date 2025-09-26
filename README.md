@@ -29,6 +29,12 @@
    ```
    Затем настройте Multi-Output Device в Audio MIDI Setup для одновременного вывода на динамики и BlackHole.
 
+5. Для получения покадровых таймингов слов используйте пакет [whisper-timestamped](https://github.com/linto-ai/whisper-timestamped) и его зависимости (включая `openai-whisper`). Установите их дополнительно:
+
+   ```bash
+   pip install whisper-timestamped openai-whisper
+   ```
+
 ## Использование
 
 Интерфейс предоставляется через модуль `sts.cli`. Его можно запускать командой:
@@ -83,6 +89,16 @@ python -m sts.cli --record --input-device "MacBook Pro Microphone" --output tran
 # Выбрать конкретное системное устройство
 python -m sts.cli --system-audio --input-device "BlackHole 2ch" --output transcript.txt
 ```
+
+### Тайминги каждого слова, субтитры и подсветка уверенности
+
+```bash
+python -m sts.cli --input meeting.wav --word-level --min-confidence 0.6 --output meeting.txt
+```
+
+Флаг `--word-level` включает использование whisper-timestamped: помимо основного текста будет сохранён JSON со списком слов, а также готовые субтитры в форматах SRT и VTT (`meeting.json`, `meeting.srt`, `meeting.vtt`).
+
+Параметр `--min-confidence` задаёт порог подсветки слов с низкой уверенностью: в консольном выводе и субтитрах такие слова будут выделены маркерами `⟪...⟫` вместе с числовым значением. Без флага `--word-level` порог игнорируется.
 
 ### Оптимизация под Mac M1 Pro
 
