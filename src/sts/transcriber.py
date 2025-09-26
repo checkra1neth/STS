@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import math
+from collections import deque
 import queue
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Deque, List, Optional, Sequence, Union
 
 import numpy as np
 import sounddevice as sd
@@ -38,6 +40,124 @@ class TranscriptionResult:
     segments: List[TranscriptionSegment]
     duration: float
     language: Optional[str]
+
+
+def _calculate_overlap(previous: str, current: str, *, max_overlap_chars: int = 160) -> int:
+    """Return the number of overlapping characters between the tail of previous and head of current."""
+
+    if not previous or not current:
+        return 0
+
+    previous_tail = previous[-max_overlap_chars :].lower()
+    current_lower = current.lower()
+    max_len = min(len(previous_tail), len(current_lower))
+
+    for overlap in range(max_len, 0, -1):
+        if previous_tail[-overlap:] == current_lower[:overlap]:
+            return overlap
+
+    return 0
+
+
+def _strip_repeated_sequences(text: str) -> str:
+    """Remove obvious repeated words or short phrases from text."""
+
+    if not text:
+        return text
+
+    normalized = text
+
+    # Сначала избавляемся от повторяющихся одиночных слов.
+    normalized = _replace_repeating_pattern(normalized, 1)
+    # Затем от повторяющихся пар слов.
+    normalized = _replace_repeating_pattern(normalized, 2)
+
+    return normalized.strip()
+
+
+def _replace_repeating_pattern(text: str, window: int) -> str:
+    """Убирает повторяющиеся последовательности длиной window слов."""
+
+    words = text.split()
+    if len(words) <= window * 2:
+        return text
+
+    cleaned: List[str] = []
+    i = 0
+    while i < len(words):
+        cleaned.append(words[i])
+        i += 1
+
+        # Проверяем повтор предыдущей последовательности
+        if i >= window:
+            prev_slice = cleaned[-window:]
+            repeat = True
+            for offset in range(window):
+                if i + offset >= len(words) or words[i + offset].lower() != prev_slice[offset].lower():
+                    repeat = False
+                    break
+
+            if repeat:
+                i += window
+
+    return " ".join(cleaned)
+
+
+def _assemble_transcription(parts: Sequence[str]) -> str:
+    """Join cleaned transcription parts while avoiding repeated fragments."""
+
+    collected: List[str] = []
+    cumulative = ""
+
+    for part in parts:
+        cleaned = _strip_repeated_sequences(part.strip())
+        if not cleaned:
+            continue
+
+        overlap = _calculate_overlap(cumulative, cleaned)
+        if overlap:
+            cleaned = cleaned[overlap:].lstrip()
+
+        if cleaned:
+            collected.append(cleaned)
+            cumulative = f"{cumulative} {cleaned}".strip()
+
+    return " ".join(collected)
+
+
+def _prepare_audio_array(audio_data: np.ndarray) -> np.ndarray:
+    """Convert arbitrary audio chunk to mono float32 array suitable for inference."""
+
+    if audio_data.ndim > 1:
+        # Усредняем каналы для повышения устойчивости и избегания повторов
+        audio_data = audio_data.mean(axis=1)
+
+    mono = audio_data.astype(np.float32, copy=False)
+
+    # Ограничиваем амплитуду, если входящий сигнал оказывается слишком громким
+    peak = np.max(np.abs(mono)) if mono.size else 0.0
+    if peak > 1.0:
+        mono = mono / peak
+
+    return mono
+
+
+def _merge_with_history(text: str, history: Deque[str]) -> str:
+    """Remove overlap with previously emitted text segments."""
+
+    cleaned = _strip_repeated_sequences(text.strip())
+    if not cleaned:
+        return ""
+
+    previous = " ".join(history)
+    overlap = _calculate_overlap(previous, cleaned)
+    if overlap:
+        cleaned = cleaned[overlap:].lstrip()
+
+    if cleaned:
+        history.append(cleaned)
+
+    return cleaned
 
 
 def capture_audio(
@@ -105,28 +225,47 @@ def load_model(
 
 def transcribe_audio(
     model: WhisperModel,
-    audio_path: Path,
+    audio_source: Union[Path, np.ndarray],
     *,
     beam_size: int = 5,
     language: Optional[str] = None,
     temperature: float = 0.0,
     vad_filter: bool = True,
+    compression_ratio_threshold: float = 2.0,
+    log_prob_threshold: float = -1.0,
+    no_speech_threshold: float = 0.6,
+    condition_on_previous_text: bool = True,
 ) -> TranscriptionResult:
     """Transcribe an audio file and aggregate the model output."""
 
+    if isinstance(audio_source, Path):
+        audio_input: Union[str, np.ndarray] = str(audio_source)
+    else:
+        audio_input = audio_source
+
     segment_iter, info = model.transcribe(
-        str(audio_path),
+        audio_input,
         beam_size=beam_size,
         language=language,
         temperature=temperature,
         vad_filter=vad_filter,
+        compression_ratio_threshold=compression_ratio_threshold,
+        log_prob_threshold=log_prob_threshold,
+        no_speech_threshold=no_speech_threshold,
+        condition_on_previous_text=condition_on_previous_text,
     )
 
     collected: List[TranscriptionSegment] = []
     text_parts: List[str] = []
+    cumulative = ""
 
     for segment in segment_iter:
-        text = segment.text.strip()
+        text = _strip_repeated_sequences(segment.text.strip())
+        if text:
+            overlap = _calculate_overlap(cumulative, text)
+            if overlap:
+                text = text[overlap:].lstrip()
+
         collected.append(
             TranscriptionSegment(
                 start=segment.start,
@@ -136,9 +275,12 @@ def transcribe_audio(
         )
         if text:
             text_parts.append(text)
+            cumulative = f"{cumulative} {text}".strip()
+
+    aggregated_text = _assemble_transcription(text_parts)
 
     return TranscriptionResult(
-        text=" ".join(text_parts),
+        text=aggregated_text,
         segments=collected,
         duration=getattr(info, "duration", 0.0),
         language=getattr(info, "language", None),
@@ -292,7 +434,7 @@ def capture_system_audio(
 
 class StreamTranscriber:
     """Class for managing streaming transcription with proper stop control."""
-    
+
     def __init__(self):
         self.recording = False
         self.audio_stream = None
@@ -300,22 +442,22 @@ class StreamTranscriber:
         self.audio_queue = None
         self.result_queue = None
         self.max_threads = 4  # Максимум параллельных потоков обработки
-        
+        self.silence_threshold = 0.0015
+        self._emitted_history: Deque[str] = deque(maxlen=12)
+        self._cumulative_text = ""
+
     def start(self, model: WhisperModel, device: Optional[int | str] = None,
               samplerate: int = 16_000, channels: int = 2, chunk_duration: float = 5.0,
               language: Optional[str] = None, beam_size: int = 5, vad_filter: bool = True,
-              overlap_ratio: float = 0.25, temperature: float = 0.0, 
+              overlap_ratio: float = 0.25, temperature: float = 0.0,
               use_threading: bool = True, callback=None):
         """Start streaming transcription."""
-        
+
         if self.recording:
             return False
             
-        import tempfile
-        import time
         import threading
-        from pathlib import Path
-        
+
         # Если устройство не указано, попробуем найти системное аудиоустройство
         if device is None:
             system_devices = find_system_audio_devices()
@@ -328,7 +470,9 @@ class StreamTranscriber:
         self.audio_queue = queue.Queue(maxsize=100)  # Большая очередь
         self.result_queue = queue.Queue()
         self.recording = True
-        
+        self._emitted_history.clear()
+        self._cumulative_text = ""
+
         # Создаем пул потоков для обработки
         import concurrent.futures
         self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=self.max_threads)
@@ -361,41 +505,41 @@ class StreamTranscriber:
                             def process_chunk_instant():
                                 try:
                                     combined_chunk = np.concatenate(chunk_to_process, axis=0)
-                                    
-                                    # Прямая обработка в памяти БЕЗ файлов
-                                    import io
-                                    buffer = io.BytesIO()
-                                    with sf.SoundFile(buffer, mode='w', samplerate=samplerate, 
-                                                    channels=channels, format='WAV') as file:
-                                        file.write(combined_chunk)
-                                    
-                                    buffer.seek(0)
-                                    
-                                    # СУПЕР-БЫСТРАЯ транскрибация
-                                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp_file:
-                                        tmp_file.write(buffer.getvalue())
-                                        tmp_file.flush()
-                                        tmp_path = Path(tmp_file.name)
-                                        
-                                        # МИНИМАЛЬНЫЕ настройки для МАКСИМАЛЬНОЙ скорости
-                                        result = transcribe_audio(
-                                            model,
-                                            tmp_path,
-                                            language=language,
-                                            beam_size=beam_size,
-                                            temperature=temperature,
-                                            vad_filter=vad_filter,
-                                        )
-                                        
-                                        # МГНОВЕННЫЙ callback
-                                        if callback and result.text.strip() and self.recording:
-                                            callback({
-                                                'text': result.text.strip(),
-                                                'language': result.language,
-                                                'timestamp': current_time,
-                                                'duration': result.duration
-                                            })
-                                
+
+                                    if not combined_chunk.size:
+                                        return
+
+                                    # Проверяем наличие полезного сигнала, чтобы не тратить время на тишину
+                                    rms = math.sqrt(float(np.mean(combined_chunk**2)))
+                                    if rms < self.silence_threshold:
+                                        return
+
+                                    audio_array = _prepare_audio_array(combined_chunk)
+                                    if not audio_array.size:
+                                        return
+
+                                    result = transcribe_audio(
+                                        model,
+                                        audio_array,
+                                        language=language,
+                                        beam_size=beam_size,
+                                        temperature=temperature,
+                                        vad_filter=vad_filter,
+                                        compression_ratio_threshold=1.8,
+                                        condition_on_previous_text=False,
+                                    )
+
+                                    addition = _merge_with_history(result.text, self._emitted_history)
+
+                                    if callback and addition and self.recording:
+                                        self._cumulative_text = f"{self._cumulative_text} {addition}".strip()
+                                        callback({
+                                            'text': addition,
+                                            'language': result.language,
+                                            'timestamp': current_time,
+                                            'duration': result.duration,
+                                        })
+
                                 except Exception as e:
                                     if self.recording:
                                         print(f"Ошибка: {e}")
