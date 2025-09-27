@@ -2,19 +2,43 @@
 
 from __future__ import annotations
 
+import json
 import math
-from collections import deque
 import queue
 import sys
+import tempfile
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Deque, List, Optional, Sequence, Set, Union
+from typing import (
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Union,
+)
 
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
 from faster_whisper import WhisperModel
+
+try:  # pragma: no cover - optional dependency
+    import whisper_timestamped as whisper_ts
+except ImportError:  # pragma: no cover - optional dependency
+    whisper_ts = None
+
+try:  # pragma: no cover - optional dependency
+    from openai import OpenAI
+except ImportError:  # pragma: no cover - optional dependency
+    OpenAI = None
 
 try:
     import ffmpeg
@@ -66,6 +90,295 @@ class TranscriptionResult:
     segments: List[TranscriptionSegment]
     duration: float
     language: Optional[str]
+
+
+@dataclass(frozen=True)
+class BackendLoadOptions:
+    """Configuration used to initialize a transcription backend."""
+
+    model: str
+    device: str = "cpu"
+    compute_type: str = "auto"
+    cpu_threads: Optional[int] = None
+    model_dir: Optional[Path] = None
+    cache_dir: Optional[Path] = None
+    extra: Optional[Mapping[str, Any]] = None
+
+
+@dataclass(frozen=True)
+class BackendSpec:
+    """Description and helpers for a particular transcription backend."""
+
+    name: str
+    aliases: tuple[str, ...]
+    loader: Callable[[BackendLoadOptions], Any]
+    transcribe: Callable[..., TranscriptionResult]
+    stream: Optional[Callable[..., None]] = None
+    description: str = ""
+
+    @property
+    def supports_streaming(self) -> bool:
+        return self.stream is not None
+
+
+@dataclass
+class LoadedBackend:
+    """Runtime object that wraps an initialized backend implementation."""
+
+    spec: BackendSpec
+    handle: Any
+    options: BackendLoadOptions
+
+    def transcribe(self, audio_source: Union[Path, np.ndarray], **kwargs: Any) -> TranscriptionResult:
+        return self.spec.transcribe(
+            self.handle,
+            audio_source,
+            backend_options=self.options,
+            **kwargs,
+        )
+
+    def stream(self, **kwargs: Any) -> None:
+        if not self.spec.supports_streaming:
+            raise RuntimeError(f"Бэкенд '{self.spec.name}' не поддерживает потоковую транскрибацию")
+        assert self.spec.stream is not None
+        self.spec.stream(self.handle, backend_options=self.options, **kwargs)
+
+
+_BACKEND_REGISTRY: Dict[str, BackendSpec] = {}
+_CANONICAL_BACKENDS: Dict[str, BackendSpec] = {}
+
+
+def register_backend(spec: BackendSpec) -> None:
+    """Register backend under its canonical name and aliases."""
+
+    canonical_key = spec.name.lower()
+    if canonical_key in _CANONICAL_BACKENDS:
+        raise ValueError(f"Бэкенд '{spec.name}' уже зарегистрирован")
+
+    _CANONICAL_BACKENDS[canonical_key] = spec
+    for alias in (spec.name, *spec.aliases):
+        _BACKEND_REGISTRY[alias.lower()] = spec
+
+
+def get_backend(name: str) -> BackendSpec:
+    try:
+        return _BACKEND_REGISTRY[name.lower()]
+    except KeyError as exc:
+        raise ValueError(f"Неизвестный бэкенд транскрибации: {name}") from exc
+
+
+def list_available_backends() -> List[BackendSpec]:
+    return sorted(_CANONICAL_BACKENDS.values(), key=lambda spec: spec.name)
+
+
+def list_backend_names() -> List[str]:
+    return [spec.name for spec in list_available_backends()]
+
+
+def load_transcription_backend(
+    backend: str,
+    model: str,
+    *,
+    device: str = "cpu",
+    compute_type: str = "auto",
+    cpu_threads: Optional[int] = None,
+    model_dir: Optional[Path] = None,
+    cache_dir: Optional[Path] = None,
+    extra: Optional[Mapping[str, Any]] = None,
+) -> LoadedBackend:
+    """Instantiate the requested backend and return a wrapper object."""
+
+    spec = get_backend(backend)
+    options = BackendLoadOptions(
+        model=model,
+        device=device,
+        compute_type=compute_type,
+        cpu_threads=cpu_threads,
+        model_dir=model_dir,
+        cache_dir=cache_dir,
+        extra=extra,
+    )
+    handle = spec.loader(options)
+    return LoadedBackend(spec=spec, handle=handle, options=options)
+
+
+def _load_faster_whisper_backend(options: BackendLoadOptions) -> WhisperModel:
+    return load_model(
+        options.model,
+        device=options.device,
+        compute_type=options.compute_type,
+        cpu_threads=options.cpu_threads,
+        model_dir=options.model_dir,
+        cache_dir=options.cache_dir,
+    )
+
+
+def _transcribe_with_faster_whisper_backend(
+    model: WhisperModel,
+    audio_source: Union[Path, np.ndarray],
+    *,
+    backend_options: BackendLoadOptions,
+    **kwargs: Any,
+) -> TranscriptionResult:
+    return _transcribe_with_faster_whisper(model, audio_source, **kwargs)
+
+
+def _stream_faster_whisper_backend(
+    model: WhisperModel,
+    *,
+    backend_options: BackendLoadOptions,
+    **kwargs: Any,
+) -> None:
+    _stream_with_faster_whisper(model, **kwargs)
+
+
+def _load_whisper_timestamped_backend(options: BackendLoadOptions) -> Any:
+    if whisper_ts is None:  # pragma: no cover - optional dependency
+        raise ImportError(
+            "Пакет whisper_timestamped не установлен. Установите его командой 'pip install whisper-timestamped'."
+        )
+
+    model_path: Union[str, Path] = options.model
+    if options.model_dir is not None:
+        model_dir = Path(options.model_dir).expanduser().resolve()
+        candidate = model_dir / options.model
+        if candidate.exists():
+            model_path = candidate
+
+    return whisper_ts.load_model(str(model_path))
+
+
+def _transcribe_with_whisper_timestamped_backend(
+    model: Any,
+    audio_source: Union[Path, np.ndarray],
+    *,
+    backend_options: BackendLoadOptions,
+    language: Optional[str] = None,
+    **_: Any,
+) -> TranscriptionResult:
+    if whisper_ts is None:  # pragma: no cover - optional dependency
+        raise ImportError(
+            "Пакет whisper_timestamped не установлен. Установите его командой 'pip install whisper-timestamped'."
+        )
+
+    if isinstance(audio_source, Path):
+        audio_input: Union[str, np.ndarray] = str(audio_source)
+    else:
+        audio_input = audio_source
+
+    result = whisper_ts.transcribe(model, audio_input, language=language)
+    raw_segments = result.get("segments", []) if isinstance(result, dict) else []
+
+    segments: List[TranscriptionSegment] = []
+    text_parts: List[str] = []
+
+    for segment in raw_segments:
+        start = float(segment.get("start", 0.0))
+        end = float(segment.get("end", start))
+        text = _strip_repeated_sequences(str(segment.get("text", "")).strip())
+        text_parts.append(text)
+        segments.append(TranscriptionSegment(start=start, end=end, text=text))
+
+    aggregated = _assemble_transcription(text_parts)
+    return TranscriptionResult(
+        text=aggregated,
+        segments=segments,
+        duration=float(result.get("duration", 0.0)) if isinstance(result, dict) else 0.0,
+        language=result.get("language") if isinstance(result, dict) else None,
+    )
+
+
+def _load_openai_backend(options: BackendLoadOptions) -> Any:
+    if OpenAI is None:  # pragma: no cover - optional dependency
+        raise ImportError(
+            "Пакет openai не установлен. Установите его командой 'pip install openai'."
+        )
+
+    extra = dict(options.extra or {})
+    api_key = extra.get("api_key")
+    if api_key:
+        return OpenAI(api_key=api_key)
+    return OpenAI()
+
+
+def _transcribe_with_openai_backend(
+    client: Any,
+    audio_source: Union[Path, np.ndarray],
+    *,
+    backend_options: BackendLoadOptions,
+    language: Optional[str] = None,
+    samplerate: int = 16_000,
+    **_: Any,
+) -> TranscriptionResult:
+    if OpenAI is None:  # pragma: no cover - optional dependency
+        raise ImportError(
+            "Пакет openai не установлен. Установите его командой 'pip install openai'."
+        )
+
+    cleanup: Optional[Path] = None
+    if isinstance(audio_source, Path):
+        file_path = audio_source
+    else:
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+        file_path = Path(tmp.name)
+        cleanup = file_path
+        sf.write(str(file_path), audio_source, samplerate)
+
+    try:
+        with file_path.open("rb") as fh:
+            response = client.audio.transcriptions.create(
+                model=backend_options.model,
+                file=fh,
+                language=language,
+            )
+    finally:
+        if cleanup and cleanup.exists():
+            cleanup.unlink()
+
+    text = getattr(response, "text", None) or response.get("text", "")
+    return TranscriptionResult(
+        text=text,
+        segments=[TranscriptionSegment(start=0.0, end=0.0, text=text)],
+        duration=0.0,
+        language=language,
+    )
+
+
+DEFAULT_BACKEND_NAME = "faster-whisper"
+
+register_backend(
+    BackendSpec(
+        name=DEFAULT_BACKEND_NAME,
+        aliases=("faster_whisper", "fwhisper", "default"),
+        loader=_load_faster_whisper_backend,
+        transcribe=_transcribe_with_faster_whisper_backend,
+        stream=_stream_faster_whisper_backend,
+        description="Локальный инференс через faster-whisper",
+    )
+)
+
+register_backend(
+    BackendSpec(
+        name="whisper-timestamped",
+        aliases=("timestamped", "wt"),
+        loader=_load_whisper_timestamped_backend,
+        transcribe=_transcribe_with_whisper_timestamped_backend,
+        stream=None,
+        description="Бэкенд whisper_timestamped для получения детальных таймкодов",
+    )
+)
+
+register_backend(
+    BackendSpec(
+        name="openai-api",
+        aliases=("openai", "api"),
+        loader=_load_openai_backend,
+        transcribe=_transcribe_with_openai_backend,
+        stream=None,
+        description="Облачный API OpenAI Whisper/Audio",
+    )
+)
 
 
 def _calculate_overlap(previous: str, current: str, *, max_overlap_chars: int = 160) -> int:
@@ -294,6 +607,8 @@ def load_model(
     device: str = "cpu",
     compute_type: str = "auto",
     cpu_threads: Optional[int] = None,
+    model_dir: Optional[Path] = None,
+    cache_dir: Optional[Path] = None,
 ) -> WhisperModel:
     """Load an optimized Whisper model via faster-whisper.
 
@@ -323,9 +638,28 @@ def load_model(
             unique_candidates.append(candidate)
             seen.add(candidate)
 
+    model_identifier: Union[str, Path] = model_size
+
+    download_root: Optional[Path] = None
+    if model_dir is not None:
+        model_dir = Path(model_dir).expanduser().resolve()
+        candidate = model_dir / model_size
+        if candidate.exists():
+            model_identifier = candidate
+        else:
+            download_root = model_dir
+
+    if cache_dir is not None:
+        cache_path = Path(cache_dir).expanduser().resolve()
+        download_root = download_root or cache_path
+
     kwargs = {
         "device": device,
     }
+
+    if download_root is not None:
+        download_root.mkdir(parents=True, exist_ok=True)
+        kwargs["download_root"] = str(download_root)
 
     if cpu_threads is not None:
         # The faster-whisper bindings expose thread configuration via num_workers
@@ -337,7 +671,7 @@ def load_model(
     for candidate in unique_candidates:
         try:
             return WhisperModel(
-                model_size,
+                str(model_identifier),
                 compute_type=candidate,
                 **kwargs,
             )
@@ -370,7 +704,7 @@ def load_model(
     raise RuntimeError("Не удалось загрузить модель Whisper: отсутствуют варианты compute_type")
 
 
-def transcribe_audio(
+def _transcribe_with_faster_whisper(
     model: WhisperModel,
     audio_source: Union[Path, np.ndarray],
     *,
@@ -432,6 +766,19 @@ def transcribe_audio(
         duration=getattr(info, "duration", 0.0),
         language=getattr(info, "language", None),
     )
+
+
+def transcribe_audio(
+    model: Union[WhisperModel, LoadedBackend],
+    audio_source: Union[Path, np.ndarray],
+    **kwargs: Any,
+) -> TranscriptionResult:
+    """Transcribe audio using either a direct model instance or a backend wrapper."""
+
+    if isinstance(model, LoadedBackend):
+        return model.transcribe(audio_source, **kwargs)
+
+    return _transcribe_with_faster_whisper(model, audio_source, **kwargs)
 
 
 def extract_audio_from_video(
@@ -820,7 +1167,7 @@ class StreamTranscriber:
         return self.recording
 
 
-def stream_transcribe(
+def _stream_with_faster_whisper(
     model: WhisperModel,
     device: Optional[int | str] = None,
     samplerate: int = 16_000,
@@ -857,3 +1204,119 @@ def stream_transcribe(
             time.sleep(0.1)
     except KeyboardInterrupt:
         transcriber.stop()
+
+
+def stream_transcribe(
+    model: Union[WhisperModel, LoadedBackend],
+    device: Optional[int | str] = None,
+    samplerate: int = 16_000,
+    channels: int = 2,
+    chunk_duration: Optional[float] = None,
+    language: Optional[str] = None,
+    profile: Optional[StreamProfile] = None,
+    callback=None,
+) -> None:
+    """Public wrapper that supports both direct models and registered backends."""
+
+    if isinstance(model, LoadedBackend):
+        model.stream(
+            device=device,
+            samplerate=samplerate,
+            channels=channels,
+            chunk_duration=chunk_duration,
+            language=language,
+            profile=profile,
+            callback=callback,
+        )
+        return
+
+    _stream_with_faster_whisper(
+        model,
+        device=device,
+        samplerate=samplerate,
+        channels=channels,
+        chunk_duration=chunk_duration,
+        language=language,
+        profile=profile,
+        callback=callback,
+    )
+
+
+@dataclass
+class StreamTraceEvent:
+    """Single entry inside an offline simulation trace."""
+
+    timestamp: float
+    text: str
+    language: Optional[str] = None
+    duration: Optional[float] = None
+
+
+def load_stream_trace(trace_path: Path) -> List[StreamTraceEvent]:
+    """Load a JSONL trace produced by a previous streaming session."""
+
+    events: List[StreamTraceEvent] = []
+    with Path(trace_path).expanduser().open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            payload = json.loads(line)
+            events.append(
+                StreamTraceEvent(
+                    timestamp=float(payload.get("timestamp", 0.0)),
+                    text=str(payload.get("text", "")),
+                    language=payload.get("language"),
+                    duration=(
+                        float(payload.get("duration"))
+                        if payload.get("duration") is not None
+                        else None
+                    ),
+                )
+            )
+
+    return events
+
+
+def replay_stream_trace(
+    trace_path: Path,
+    callback: Callable[[Dict[str, Any]], None],
+    *,
+    speed: float = 1.0,
+    loop: bool = False,
+    warmup: float = 0.0,
+) -> None:
+    """Replay a previously recorded streaming trace."""
+
+    if speed <= 0:
+        raise ValueError("Коэффициент speed должен быть больше нуля")
+
+    events = load_stream_trace(trace_path)
+    if not events:
+        raise ValueError("Трасса пуста — нечего воспроизводить")
+
+    baseline = events[0].timestamp
+    normalized = [StreamTraceEvent(timestamp=e.timestamp - baseline, text=e.text, language=e.language, duration=e.duration) for e in events]
+
+    while True:
+        start_wall = time.time() + warmup
+        for event in normalized:
+            target = event.timestamp / speed
+            while True:
+                elapsed = time.time() - start_wall
+                remaining = target - elapsed
+                if remaining <= 0:
+                    break
+                time.sleep(min(remaining, 0.05))
+
+            payload: Dict[str, Any] = {
+                "text": event.text,
+                "language": event.language,
+                "timestamp": event.timestamp,
+            }
+            if event.duration is not None:
+                payload["duration"] = event.duration
+            callback(payload)
+
+        if not loop:
+            break
