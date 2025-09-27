@@ -9,6 +9,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+import threading
 from typing import Deque, List, Optional, Sequence, Set, Union
 
 import numpy as np
@@ -35,6 +36,10 @@ class StreamProfile:
     temperature: float
     use_threading: bool
     cpu_threads: Optional[int]
+    adaptive_enabled: bool = False
+    adaptive_target_latency: float = 1.5
+    adaptive_min_chunk: float = 0.5
+    adaptive_max_chunk: float = 6.0
 
 
 BEST_STREAM_PROFILE = StreamProfile(
@@ -46,6 +51,10 @@ BEST_STREAM_PROFILE = StreamProfile(
     temperature=0.0,
     use_threading=True,
     cpu_threads=4,
+    adaptive_enabled=True,
+    adaptive_target_latency=1.4,
+    adaptive_min_chunk=0.9,
+    adaptive_max_chunk=4.0,
 )
 
 
@@ -592,18 +601,44 @@ class StreamTranscriber:
         self.silence_threshold = 0.0015
         self._emitted_history: Deque[str] = deque(maxlen=12)
         self._cumulative_text = ""
+        self._latency_measurements: Deque[float] = deque(maxlen=50)
+        self._audio_durations: Deque[float] = deque(maxlen=50)
+        self._metrics_lock = threading.Lock()
+        self._metrics_logger = None
+        self._adaptive_enabled = False
+        self._target_latency = 1.5
+        self._min_chunk_duration = 0.5
+        self._max_chunk_duration = 6.0
+        self._current_chunk_duration = 0.5
+        self._min_chunk_samples = 0
+        self._max_chunk_samples = 0
+        self._target_chunk_samples = 0
+        self._samplerate = 16_000
 
-    def start(self, model: WhisperModel, device: Optional[int | str] = None,
-              samplerate: int = 16_000, channels: int = 2, chunk_duration: float = 5.0,
-              language: Optional[str] = None, beam_size: int = 5, vad_filter: bool = True,
-              overlap_ratio: float = 0.25, temperature: float = 0.0,
-              use_threading: bool = True, callback=None):
+    def start(
+        self,
+        model: WhisperModel,
+        device: Optional[int | str] = None,
+        samplerate: int = 16_000,
+        channels: int = 2,
+        chunk_duration: float = 5.0,
+        language: Optional[str] = None,
+        beam_size: int = 5,
+        vad_filter: bool = True,
+        overlap_ratio: float = 0.25,
+        temperature: float = 0.0,
+        use_threading: bool = True,
+        callback=None,
+        adaptive_enabled: bool = False,
+        adaptive_target_latency: float = 1.5,
+        adaptive_min_chunk: Optional[float] = None,
+        adaptive_max_chunk: Optional[float] = None,
+        metrics_logger=None,
+    ):
         """Start streaming transcription."""
 
         if self.recording:
             return False
-            
-        import threading
 
         # Если устройство не указано, попробуем найти системное аудиоустройство
         if device is None:
@@ -613,55 +648,75 @@ class StreamTranscriber:
                 print(f"Используется системное аудиоустройство: {system_devices[0]['name']}")
             else:
                 print("Системное аудиоустройство не найдено.")
-        
+
         self.audio_queue = queue.Queue(maxsize=100)  # Большая очередь
         self.result_queue = queue.Queue()
         self.recording = True
         self._emitted_history.clear()
         self._cumulative_text = ""
+        self.processing_threads = []
+        with self._metrics_lock:
+            self._latency_measurements.clear()
+            self._audio_durations.clear()
+        self._metrics_logger = metrics_logger
+        self._adaptive_enabled = adaptive_enabled
+        self._target_latency = max(adaptive_target_latency, 0.1)
+        self._samplerate = samplerate
+
+        min_bound = adaptive_min_chunk if adaptive_min_chunk is not None else 0.5
+        max_bound = adaptive_max_chunk if adaptive_max_chunk is not None else max(chunk_duration, 6.0)
+        self._min_chunk_duration = max(min_bound, 0.2)
+        self._max_chunk_duration = max(self._min_chunk_duration, max_bound)
+
+        base_chunk = max(chunk_duration, self._min_chunk_duration)
+        base_chunk = min(base_chunk, self._max_chunk_duration)
+        self._current_chunk_duration = base_chunk
+
+        self._min_chunk_samples = max(int(self._min_chunk_duration * samplerate), samplerate // 4, 1)
+        self._max_chunk_samples = max(int(self._max_chunk_duration * samplerate), self._min_chunk_samples)
+        target_samples = int(self._current_chunk_duration * samplerate)
+        target_samples = max(target_samples, self._min_chunk_samples)
+        self._target_chunk_samples = min(target_samples, self._max_chunk_samples)
 
         # Создаем пул потоков для обработки
         import concurrent.futures
+
         self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=self.max_threads)
-        
+
         def audio_callback(indata: np.ndarray, frames: int, time, status) -> None:  # type: ignore[override]
             if status:
                 print(status, file=sys.stderr)
             if self.recording:
                 self.audio_queue.put(indata.copy())
-        
-        min_chunk_duration = max(chunk_duration, 0.4)
-        target_chunk_samples = max(int(min_chunk_duration * samplerate), samplerate // 2)
 
         def process_audio_chunks():
             """Process audio chunks in separate thread."""
+
             chunk_data: List[np.ndarray] = []
             chunk_start_time = time.time()
             chunk_samples = 0
 
             while self.recording or not self.audio_queue.empty():
                 try:
-                    # Получаем аудиоданные с таймаутом
                     audio_chunk = self.audio_queue.get(timeout=0.1)
                     chunk_data.append(audio_chunk)
                     chunk_samples += len(audio_chunk)
 
-                    # Проверяем, прошло ли достаточно времени для обработки чанка
                     current_time = time.time()
-                    duration_ready = current_time - chunk_start_time >= chunk_duration
-                    samples_ready = chunk_samples >= target_chunk_samples
+                    duration_ready = current_time - chunk_start_time >= self._current_chunk_duration
+                    samples_ready = chunk_samples >= self._target_chunk_samples
 
                     if (duration_ready or samples_ready) and chunk_data:
                         combined_chunk = np.concatenate(chunk_data, axis=0)
                         processed_samples = combined_chunk.shape[0]
 
                         if processed_samples and self.recording:
+
                             def process_chunk_instant(chunk_array=combined_chunk, emitted_time=current_time):
                                 try:
                                     if not chunk_array.size:
                                         return
 
-                                    # Проверяем наличие полезного сигнала, чтобы не тратить время на тишину
                                     rms = math.sqrt(float(np.mean(chunk_array**2)))
                                     if rms < self.silence_threshold:
                                         return
@@ -670,6 +725,7 @@ class StreamTranscriber:
                                     if not audio_array.size:
                                         return
 
+                                    inference_started = time.perf_counter()
                                     result = transcribe_audio(
                                         model,
                                         audio_array,
@@ -679,6 +735,11 @@ class StreamTranscriber:
                                         vad_filter=vad_filter,
                                         compression_ratio_threshold=1.8,
                                         condition_on_previous_text=False,
+                                    )
+                                    inference_duration = time.perf_counter() - inference_started
+                                    self._handle_inference_metrics(
+                                        inference_duration,
+                                        audio_array.size / float(self._samplerate),
                                     )
 
                                     addition = _merge_with_history(result.text, self._emitted_history)
@@ -738,6 +799,7 @@ class StreamTranscriber:
                         if not audio_array.size:
                             return
 
+                        inference_started = time.perf_counter()
                         result = transcribe_audio(
                             model,
                             audio_array,
@@ -747,6 +809,11 @@ class StreamTranscriber:
                             vad_filter=vad_filter,
                             compression_ratio_threshold=1.8,
                             condition_on_previous_text=False,
+                        )
+                        inference_duration = time.perf_counter() - inference_started
+                        self._handle_inference_metrics(
+                            inference_duration,
+                            audio_array.size / float(self._samplerate),
                         )
 
                         addition = _merge_with_history(result.text, self._emitted_history)
@@ -767,14 +834,14 @@ class StreamTranscriber:
                     self.thread_pool.submit(flush_chunk)
                 else:
                     flush_chunk()
-        
+
         print("Начинаю потоковую транскрибацию.")
-        
-        # Запускаем обработку аудио в отдельном потоке
-        self.processing_thread = threading.Thread(target=process_audio_chunks)
-        self.processing_thread.daemon = True
-        self.processing_thread.start()
-        
+
+        processing_thread = threading.Thread(target=process_audio_chunks)
+        processing_thread.daemon = True
+        processing_thread.start()
+        self.processing_threads.append(processing_thread)
+
         try:
             self.audio_stream = sd.InputStream(
                 samplerate=samplerate,
@@ -785,39 +852,139 @@ class StreamTranscriber:
             )
             self.audio_stream.start()
             return True
-            
+
         except Exception as e:
             print(f"Ошибка запуска аудиопотока: {e}")
             self.recording = False
             return False
-    
+
     def stop(self):
         """Stop streaming transcription."""
         if not self.recording:
             return
-            
+
         print("Останавливаю потоковую транскрибацию...")
         self.recording = False
-        
+
         if self.audio_stream:
             self.audio_stream.stop()
             self.audio_stream.close()
             self.audio_stream = None
-        
-        # Останавливаем пул потоков
+
         if hasattr(self, 'thread_pool'):
             self.thread_pool.shutdown(wait=False)
-        
-        # Останавливаем основной поток обработки
+
         for thread in self.processing_threads:
             if thread.is_alive():
                 thread.join(timeout=0.5)
-        
+
+        self.processing_threads = []
+
         print("Транскрибация остановлена.")
-    
+
     def is_recording(self):
         """Check if transcription is active."""
         return self.recording
+
+    def _handle_inference_metrics(self, inference_time: float, audio_duration: float) -> None:
+        with self._metrics_lock:
+            self._latency_measurements.append(inference_time)
+            self._audio_durations.append(audio_duration)
+            metrics = self._calculate_metrics_locked()
+            if self._adaptive_enabled:
+                adjusted = self._apply_adaptive_adjustment_locked(metrics)
+                if adjusted:
+                    metrics["chunk_duration"] = self._current_chunk_duration
+                    metrics["target_chunk_samples"] = float(self._target_chunk_samples)
+            else:
+                metrics["chunk_duration"] = self._current_chunk_duration
+                metrics["target_chunk_samples"] = float(self._target_chunk_samples)
+
+        self._emit_metrics(metrics)
+
+    def _calculate_metrics_locked(self) -> dict[str, float]:
+        latencies = list(self._latency_measurements)
+        audio_durations = list(self._audio_durations)
+
+        metrics: dict[str, float] = {
+            "latency_last": latencies[-1] if latencies else 0.0,
+            "target_latency": self._target_latency,
+            "chunk_duration": self._current_chunk_duration,
+            "target_chunk_samples": float(self._target_chunk_samples),
+            "latency_window": float(len(latencies)),
+            "adaptive_enabled": float(1 if self._adaptive_enabled else 0),
+        }
+
+        if latencies:
+            latencies_array = np.asarray(latencies, dtype=np.float32)
+            metrics["latency_avg"] = float(np.mean(latencies_array))
+            metrics["latency_p50"] = float(np.percentile(latencies_array, 50))
+            metrics["latency_p90"] = float(np.percentile(latencies_array, 90))
+
+        if audio_durations:
+            durations_array = np.asarray(audio_durations, dtype=np.float32)
+            metrics["audio_avg"] = float(np.mean(durations_array))
+            metrics["audio_p50"] = float(np.percentile(durations_array, 50))
+            metrics["audio_p90"] = float(np.percentile(durations_array, 90))
+
+        return metrics
+
+    def _apply_adaptive_adjustment_locked(self, metrics: dict[str, float]) -> bool:
+        median_latency = metrics.get("latency_p50")
+        target_latency = self._target_latency
+        if median_latency is None or target_latency <= 0:
+            return False
+
+        if median_latency > target_latency * 1.05:
+            ratio = min((median_latency / target_latency) - 1.0, 0.5)
+            new_duration = self._current_chunk_duration * (1.0 - 0.2 * ratio)
+        elif median_latency < target_latency * 0.85:
+            ratio = min((target_latency / max(median_latency, 1e-6)) - 1.0, 0.5)
+            new_duration = self._current_chunk_duration * (1.0 + 0.2 * ratio)
+        else:
+            return False
+
+        new_duration = float(np.clip(new_duration, self._min_chunk_duration, self._max_chunk_duration))
+        if math.isclose(new_duration, self._current_chunk_duration, rel_tol=1e-2, abs_tol=0.05):
+            return False
+
+        self._current_chunk_duration = new_duration
+        new_target_samples = int(new_duration * self._samplerate)
+        new_target_samples = max(new_target_samples, self._min_chunk_samples)
+        new_target_samples = min(new_target_samples, self._max_chunk_samples)
+        self._target_chunk_samples = new_target_samples
+        metrics["chunk_duration"] = new_duration
+        metrics["target_chunk_samples"] = float(new_target_samples)
+        return True
+
+    def _emit_metrics(self, metrics: dict[str, float]) -> None:
+        logger = self._metrics_logger
+        if logger is not None:
+            try:
+                logger(metrics)
+            except Exception as exc:  # noqa: BLE001
+                print(f"Ошибка логгера метрик: {exc}")
+            return
+
+        if not metrics:
+            return
+
+        latency_last = metrics.get("latency_last", 0.0)
+        latency_avg = metrics.get("latency_avg")
+        latency_p90 = metrics.get("latency_p90")
+        chunk_duration = metrics.get("chunk_duration", 0.0)
+        target_latency = metrics.get("target_latency", 0.0)
+        message_parts = [
+            f"[metrics] last={latency_last:.3f}s",
+            f"target={target_latency:.3f}s",
+            f"chunk={chunk_duration:.3f}s",
+        ]
+        if latency_avg is not None:
+            message_parts.append(f"avg={latency_avg:.3f}s")
+        if latency_p90 is not None:
+            message_parts.append(f"p90={latency_p90:.3f}s")
+
+        print(" ".join(message_parts))
 
 
 def stream_transcribe(
@@ -829,12 +996,28 @@ def stream_transcribe(
     language: Optional[str] = None,
     profile: Optional[StreamProfile] = None,
     callback=None,
+    adaptive: Optional[bool] = None,
+    target_latency: Optional[float] = None,
+    min_chunk_duration: Optional[float] = None,
+    max_chunk_duration: Optional[float] = None,
+    metrics_logger=None,
 ) -> None:
     """Stream transcription in real-time with callback for results."""
 
     transcriber = StreamTranscriber()
     active_profile = profile or BEST_STREAM_PROFILE
     effective_chunk = chunk_duration if chunk_duration is not None else active_profile.chunk_duration
+
+    adaptive_enabled = active_profile.adaptive_enabled if adaptive is None else adaptive
+    target_latency_value = (
+        target_latency if target_latency is not None else active_profile.adaptive_target_latency
+    )
+    min_chunk_value = (
+        min_chunk_duration if min_chunk_duration is not None else active_profile.adaptive_min_chunk
+    )
+    max_chunk_value = (
+        max_chunk_duration if max_chunk_duration is not None else active_profile.adaptive_max_chunk
+    )
 
     if not transcriber.start(
         model,
@@ -849,6 +1032,11 @@ def stream_transcribe(
         temperature=active_profile.temperature,
         use_threading=active_profile.use_threading,
         callback=callback,
+        adaptive_enabled=adaptive_enabled,
+        adaptive_target_latency=target_latency_value,
+        adaptive_min_chunk=min_chunk_value,
+        adaptive_max_chunk=max_chunk_value,
+        metrics_logger=metrics_logger,
     ):
         return
 
