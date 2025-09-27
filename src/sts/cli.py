@@ -66,6 +66,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Потоковая транскрибация в реальном времени (консольный режим).",
     )
     parser.add_argument(
+        "--adaptive-stream",
+        dest="adaptive_stream",
+        action="store_true",
+        help="Включить адаптивную регулировку размера аудиочанков в потоковом режиме.",
+    )
+    parser.add_argument(
+        "--no-adaptive-stream",
+        dest="adaptive_stream",
+        action="store_false",
+        help="Отключить адаптивную регулировку размера аудиочанков в потоковом режиме.",
+    )
+    parser.set_defaults(adaptive_stream=None)
+    parser.add_argument(
         "--model",
         default="small",
         help="Размер модели Whisper. small — оптимальный баланс качества и скорости для CPU и поддерживает многие языки.",
@@ -117,6 +130,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Длительность записи в секундах (только для --system-audio). Если не указано, запись до Ctrl+C.",
+    )
+    parser.add_argument(
+        "--adaptive-target-latency",
+        type=float,
+        default=None,
+        help="Целевая задержка инференса в адаптивном режиме (секунды).",
+    )
+    parser.add_argument(
+        "--adaptive-chunk-min",
+        type=float,
+        default=None,
+        help="Минимальная длительность аудиочанка для адаптивного режима (секунды).",
+    )
+    parser.add_argument(
+        "--adaptive-chunk-max",
+        type=float,
+        default=None,
+        help="Максимальная длительность аудиочанка для адаптивного режима (секунды).",
     )
     parser.add_argument(
         "--output",
@@ -260,12 +291,57 @@ def main(argv: Optional[list[str]] = None) -> None:
                 with open(args.output, 'a', encoding='utf-8') as f:
                     f.write(f"{result['text']} ")
 
+        def log_metrics(metrics: dict[str, float]) -> None:
+            latency_last = metrics.get("latency_last", 0.0)
+            target_latency = metrics.get("target_latency", 0.0)
+            chunk_value = metrics.get("chunk_duration", 0.0)
+            latency_avg = metrics.get("latency_avg")
+            latency_p90 = metrics.get("latency_p90")
+            window = int(metrics.get("latency_window", 0))
+            parts = [
+                f"last={latency_last:.3f}s",
+                f"target={target_latency:.3f}s",
+                f"chunk={chunk_value:.3f}s",
+                f"window={window}",
+            ]
+            if latency_avg is not None:
+                parts.append(f"avg={latency_avg:.3f}s")
+            if latency_p90 is not None:
+                parts.append(f"p90={latency_p90:.3f}s")
+            print(f"[metrics] {' '.join(parts)}", file=sys.stderr)
+
+        adaptive_enabled = (
+            profile.adaptive_enabled if args.adaptive_stream is None else args.adaptive_stream
+        )
+        target_latency = (
+            args.adaptive_target_latency
+            if args.adaptive_target_latency is not None
+            else profile.adaptive_target_latency
+        )
+        min_chunk = (
+            args.adaptive_chunk_min
+            if args.adaptive_chunk_min is not None
+            else profile.adaptive_min_chunk
+        )
+        max_chunk = (
+            args.adaptive_chunk_max
+            if args.adaptive_chunk_max is not None
+            else profile.adaptive_max_chunk
+        )
+
         stream_transcribe(
             model=model,
             device=_parse_input_device(args.input_device),
+            samplerate=args.samplerate,
+            channels=args.channels,
             language=requested_language,
             profile=profile,
-            callback=print_result
+            callback=print_result,
+            adaptive=adaptive_enabled,
+            target_latency=target_latency,
+            min_chunk_duration=min_chunk,
+            max_chunk_duration=max_chunk,
+            metrics_logger=log_metrics,
         )
         return
 
