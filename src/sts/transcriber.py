@@ -9,7 +9,9 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Deque, List, Optional, Sequence, Set, Union
+from typing import Deque, Dict, List, Optional, Sequence, Set, Union
+
+import threading
 
 import numpy as np
 import sounddevice as sd
@@ -35,6 +37,10 @@ class StreamProfile:
     temperature: float
     use_threading: bool
     cpu_threads: Optional[int]
+    buffer_strategy: str = "sentence"
+    buffer_pause: float = 0.6
+    buffer_trimming: bool = True
+    buffer_trimming_sec: float = 12.0
 
 
 BEST_STREAM_PROFILE = StreamProfile(
@@ -46,6 +52,10 @@ BEST_STREAM_PROFILE = StreamProfile(
     temperature=0.0,
     use_threading=True,
     cpu_threads=4,
+    buffer_strategy="sentence",
+    buffer_pause=0.6,
+    buffer_trimming=True,
+    buffer_trimming_sec=12.0,
 )
 
 
@@ -206,8 +216,8 @@ def _prepare_audio_array(audio_data: np.ndarray) -> np.ndarray:
     return mono
 
 
-def _merge_with_history(text: str, history: Deque[str]) -> str:
-    """Remove overlap with previously emitted text segments."""
+def _deduplicate_candidate(text: str, history: Deque[str]) -> str:
+    """Clean text and drop it if it heavily overlaps with previously emitted fragments."""
 
     cleaned = _strip_repeated_sequences(text.strip())
     if not cleaned:
@@ -222,10 +232,227 @@ def _merge_with_history(text: str, history: Deque[str]) -> str:
         if _looks_like_duplicate(cleaned, recent):
             return ""
 
-    if cleaned:
-        history.append(cleaned)
-
     return cleaned
+
+
+@dataclass
+class _BufferedSegment:
+    start: float
+    end: float
+    text: str
+
+
+class BaseBufferManager:
+    """Base class for buffering strategies that smoothen streaming transcripts."""
+
+    def __init__(
+        self,
+        *,
+        history_size: int = 12,
+        trimming_enabled: bool = True,
+        trimming_window: float = 12.0,
+    ) -> None:
+        self._history: Deque[str] = deque(maxlen=history_size)
+        self._trimming_enabled = trimming_enabled
+        self._trimming_window = trimming_window
+
+    def reset(self) -> None:
+        self._history.clear()
+
+    def configure_trimming(self, enabled: Optional[bool] = None, window: Optional[float] = None) -> None:
+        if enabled is not None:
+            self._trimming_enabled = enabled
+        if window is not None:
+            self._trimming_window = max(window, 0.0)
+
+    @property
+    def trimming_enabled(self) -> bool:
+        return self._trimming_enabled
+
+    @property
+    def trimming_window(self) -> float:
+        return self._trimming_window
+
+    def _append_history(self, text: str) -> str:
+        deduplicated = _deduplicate_candidate(text, self._history)
+        if deduplicated:
+            self._history.append(deduplicated)
+        return deduplicated
+
+    def push(
+        self,
+        segments: Sequence[TranscriptionSegment],
+        *,
+        chunk_offset: float,
+        chunk_duration: float,
+    ) -> List[str]:
+        raise NotImplementedError
+
+    def finalize(self) -> List[str]:
+        return []
+
+
+class SegmentBufferManager(BaseBufferManager):
+    """Emit each Whisper segment individually with duplicate suppression."""
+
+    def push(
+        self,
+        segments: Sequence[TranscriptionSegment],
+        *,
+        chunk_offset: float,
+        chunk_duration: float,
+    ) -> List[str]:
+        emitted: List[str] = []
+        for segment in segments:
+            cleaned = self._append_history(segment.text)
+            if cleaned:
+                emitted.append(cleaned)
+        return emitted
+
+
+class SentenceBufferManager(BaseBufferManager):
+    """Accumulate segments until a pause or punctuation indicates sentence stability."""
+
+    def __init__(
+        self,
+        *,
+        pause_threshold: float = 0.6,
+        sentence_endings: str = ".!?…",
+        history_size: int = 12,
+        trimming_enabled: bool = True,
+        trimming_window: float = 12.0,
+    ) -> None:
+        super().__init__(
+            history_size=history_size,
+            trimming_enabled=trimming_enabled,
+            trimming_window=trimming_window,
+        )
+        self._pause_threshold = max(pause_threshold, 0.0)
+        self._sentence_endings = sentence_endings
+        self._buffer: List[_BufferedSegment] = []
+
+    def reset(self) -> None:
+        super().reset()
+        self._buffer.clear()
+
+    def push(
+        self,
+        segments: Sequence[TranscriptionSegment],
+        *,
+        chunk_offset: float,
+        chunk_duration: float,
+    ) -> List[str]:
+        emitted: List[str] = []
+
+        for segment in segments:
+            cleaned_text = _strip_repeated_sequences(segment.text.strip())
+            if not cleaned_text:
+                continue
+
+            buffered = _BufferedSegment(
+                start=chunk_offset + segment.start,
+                end=chunk_offset + segment.end,
+                text=cleaned_text,
+            )
+            self._buffer.append(buffered)
+
+        emitted.extend(self._finalize_ready_segments())
+
+        if self.trimming_enabled:
+            emitted.extend(self._trim_stale_segments(chunk_offset + chunk_duration))
+
+        return emitted
+
+    def _finalize_ready_segments(self) -> List[str]:
+        emitted: List[str] = []
+
+        while True:
+            finalize_index = self._find_finalizable_index()
+            if finalize_index is None:
+                break
+
+            chunk_text = " ".join(segment.text for segment in self._buffer[: finalize_index + 1])
+            del self._buffer[: finalize_index + 1]
+
+            confirmed = self._append_history(chunk_text)
+            if confirmed:
+                emitted.append(confirmed)
+
+        return emitted
+
+    def _find_finalizable_index(self) -> Optional[int]:
+        finalize_index: Optional[int] = None
+
+        for idx, segment in enumerate(self._buffer):
+            stripped = segment.text.rstrip()
+            ends_sentence = bool(stripped) and stripped[-1] in self._sentence_endings
+
+            long_pause = False
+            if idx + 1 < len(self._buffer):
+                next_segment = self._buffer[idx + 1]
+                long_pause = (next_segment.start - segment.end) >= self._pause_threshold
+
+            if ends_sentence or long_pause:
+                finalize_index = idx
+
+        return finalize_index
+
+    def _trim_stale_segments(self, current_time: float) -> List[str]:
+        if not self._buffer:
+            return []
+
+        threshold = current_time - self.trimming_window
+        if threshold <= 0:
+            return []
+
+        finalize_index = -1
+        for idx, segment in enumerate(self._buffer):
+            if segment.end <= threshold:
+                finalize_index = idx
+            else:
+                break
+
+        if finalize_index < 0:
+            return []
+
+        chunk_text = " ".join(segment.text for segment in self._buffer[: finalize_index + 1])
+        del self._buffer[: finalize_index + 1]
+
+        confirmed = self._append_history(chunk_text)
+        return [confirmed] if confirmed else []
+
+    def finalize(self) -> List[str]:
+        if not self._buffer:
+            return []
+
+        chunk_text = " ".join(segment.text for segment in self._buffer)
+        self._buffer.clear()
+
+        confirmed = self._append_history(chunk_text)
+        return [confirmed] if confirmed else []
+
+
+def create_buffer_manager(
+    strategy: str,
+    *,
+    pause_threshold: float = 0.6,
+    trimming_enabled: bool = True,
+    trimming_window: float = 12.0,
+) -> BaseBufferManager:
+    normalized = strategy.lower()
+    if normalized == "segment":
+        manager = SegmentBufferManager(
+            trimming_enabled=trimming_enabled,
+            trimming_window=trimming_window,
+        )
+    else:
+        manager = SentenceBufferManager(
+            pause_threshold=pause_threshold,
+            trimming_enabled=trimming_enabled,
+            trimming_window=trimming_window,
+        )
+
+    return manager
 
 
 def get_best_stream_profile() -> StreamProfile:
@@ -590,21 +817,40 @@ class StreamTranscriber:
         self.result_queue = None
         self.max_threads = 4  # Максимум параллельных потоков обработки
         self.silence_threshold = 0.0015
-        self._emitted_history: Deque[str] = deque(maxlen=12)
         self._cumulative_text = ""
+        self._buffer_manager: Optional[BaseBufferManager] = None
+        self._chunk_lock = threading.Lock()
+        self._pending_chunks: Dict[int, tuple[float, float, float, TranscriptionResult]] = {}
+        self._next_chunk_index = 0
+        self._next_chunk_to_emit = 0
+        self._timeline_cursor = 0.0
+        self._callback = None
+        self._last_language: Optional[str] = None
 
-    def start(self, model: WhisperModel, device: Optional[int | str] = None,
-              samplerate: int = 16_000, channels: int = 2, chunk_duration: float = 5.0,
-              language: Optional[str] = None, beam_size: int = 5, vad_filter: bool = True,
-              overlap_ratio: float = 0.25, temperature: float = 0.0,
-              use_threading: bool = True, callback=None):
+    def start(
+        self,
+        model: WhisperModel,
+        device: Optional[int | str] = None,
+        samplerate: int = 16_000,
+        channels: int = 2,
+        chunk_duration: float = 5.0,
+        language: Optional[str] = None,
+        beam_size: int = 5,
+        vad_filter: bool = True,
+        overlap_ratio: float = 0.25,
+        temperature: float = 0.0,
+        use_threading: bool = True,
+        buffer_strategy: str = "sentence",
+        buffer_pause: float = 0.6,
+        buffer_trimming: bool = True,
+        buffer_trimming_sec: float = 12.0,
+        callback=None,
+    ):
         """Start streaming transcription."""
 
         if self.recording:
             return False
             
-        import threading
-
         # Если устройство не указано, попробуем найти системное аудиоустройство
         if device is None:
             system_devices = find_system_audio_devices()
@@ -617,8 +863,21 @@ class StreamTranscriber:
         self.audio_queue = queue.Queue(maxsize=100)  # Большая очередь
         self.result_queue = queue.Queue()
         self.recording = True
-        self._emitted_history.clear()
         self._cumulative_text = ""
+        self._pending_chunks.clear()
+        self._next_chunk_index = 0
+        self._next_chunk_to_emit = 0
+        self._timeline_cursor = 0.0
+        self._callback = callback
+        self._last_language = None
+
+        self._buffer_manager = create_buffer_manager(
+            buffer_strategy,
+            pause_threshold=buffer_pause,
+            trimming_enabled=buffer_trimming,
+            trimming_window=buffer_trimming_sec,
+        )
+        self._buffer_manager.reset()
 
         # Создаем пул потоков для обработки
         import concurrent.futures
@@ -655,54 +914,114 @@ class StreamTranscriber:
                         combined_chunk = np.concatenate(chunk_data, axis=0)
                         processed_samples = combined_chunk.shape[0]
 
+                        overlap_samples = 0
+
                         if processed_samples and self.recording:
-                            def process_chunk_instant(chunk_array=combined_chunk, emitted_time=current_time):
-                                try:
-                                    if not chunk_array.size:
-                                        return
+                            chunk_duration_sec = processed_samples / float(samplerate) if samplerate else 0.0
+                            overlap_samples = int(processed_samples * overlap_ratio) if overlap_ratio > 0 else 0
+                            non_overlap_samples = max(processed_samples - overlap_samples, 0)
 
-                                    # Проверяем наличие полезного сигнала, чтобы не тратить время на тишину
-                                    rms = math.sqrt(float(np.mean(chunk_array**2)))
-                                    if rms < self.silence_threshold:
-                                        return
+                            chunk_offset = self._timeline_cursor
+                            self._timeline_cursor += non_overlap_samples / float(samplerate) if samplerate else 0.0
 
-                                    audio_array = _prepare_audio_array(chunk_array)
-                                    if not audio_array.size:
-                                        return
+                            chunk_index = self._next_chunk_index
+                            self._next_chunk_index += 1
 
-                                    result = transcribe_audio(
-                                        model,
-                                        audio_array,
-                                        language=language,
-                                        beam_size=beam_size,
-                                        temperature=temperature,
-                                        vad_filter=vad_filter,
-                                        compression_ratio_threshold=1.8,
-                                        condition_on_previous_text=False,
+                            chunk_rms = math.sqrt(float(np.mean(combined_chunk**2))) if combined_chunk.size else 0.0
+
+                            if chunk_rms < self.silence_threshold:
+                                silent_result = TranscriptionResult(
+                                    text="",
+                                    segments=[],
+                                    duration=chunk_duration_sec,
+                                    language=None,
+                                )
+                                self._register_chunk_result(
+                                    chunk_index,
+                                    chunk_offset,
+                                    chunk_duration_sec,
+                                    current_time,
+                                    silent_result,
+                                    callback,
+                                )
+                            else:
+                                def process_chunk_instant(
+                                    chunk_array=combined_chunk,
+                                    emitted_time=current_time,
+                                    local_chunk_index=chunk_index,
+                                    local_chunk_offset=chunk_offset,
+                                    local_chunk_duration=chunk_duration_sec,
+                                ):
+                                    empty_result = TranscriptionResult(
+                                        text="",
+                                        segments=[],
+                                        duration=local_chunk_duration,
+                                        language=None,
                                     )
 
-                                    addition = _merge_with_history(result.text, self._emitted_history)
+                                    try:
+                                        if not chunk_array.size:
+                                            self._register_chunk_result(
+                                                local_chunk_index,
+                                                local_chunk_offset,
+                                                local_chunk_duration,
+                                                emitted_time,
+                                                empty_result,
+                                                callback,
+                                            )
+                                            return
 
-                                    if callback and addition and self.recording:
-                                        self._cumulative_text = f"{self._cumulative_text} {addition}".strip()
-                                        callback({
-                                            'text': addition,
-                                            'language': result.language,
-                                            'timestamp': emitted_time,
-                                            'duration': result.duration,
-                                        })
+                                        audio_array = _prepare_audio_array(chunk_array)
+                                        if not audio_array.size:
+                                            self._register_chunk_result(
+                                                local_chunk_index,
+                                                local_chunk_offset,
+                                                local_chunk_duration,
+                                                emitted_time,
+                                                empty_result,
+                                                callback,
+                                            )
+                                            return
 
-                                except Exception as e:
-                                    if self.recording:
-                                        print(f"Ошибка: {e}")
+                                        result = transcribe_audio(
+                                            model,
+                                            audio_array,
+                                            language=language,
+                                            beam_size=beam_size,
+                                            temperature=temperature,
+                                            vad_filter=vad_filter,
+                                            compression_ratio_threshold=1.8,
+                                            condition_on_previous_text=False,
+                                        )
 
-                            if use_threading:
-                                self.thread_pool.submit(process_chunk_instant)
-                            else:
-                                process_chunk_instant()
+                                    except Exception as e:
+                                        if self.recording:
+                                            print(f"Ошибка: {e}")
+
+                                        self._register_chunk_result(
+                                            local_chunk_index,
+                                            local_chunk_offset,
+                                            local_chunk_duration,
+                                            emitted_time,
+                                            empty_result,
+                                            callback,
+                                        )
+                                    else:
+                                        self._register_chunk_result(
+                                            local_chunk_index,
+                                            local_chunk_offset,
+                                            local_chunk_duration,
+                                            emitted_time,
+                                            result,
+                                            callback,
+                                        )
+
+                                if use_threading:
+                                    self.thread_pool.submit(process_chunk_instant)
+                                else:
+                                    process_chunk_instant()
 
                         if overlap_ratio > 0 and processed_samples > 0:
-                            overlap_samples = int(processed_samples * overlap_ratio)
                             if overlap_samples > 0:
                                 chunk_data = [combined_chunk[-overlap_samples:]]
                                 chunk_samples = overlap_samples
@@ -726,16 +1045,62 @@ class StreamTranscriber:
                 combined_chunk = np.concatenate(chunk_data, axis=0)
 
                 def flush_chunk(chunk_array=combined_chunk):
+                    chunk_duration_sec = chunk_array.shape[0] / float(samplerate) if samplerate else 0.0
+                    chunk_offset = self._timeline_cursor
+                    self._timeline_cursor += chunk_duration_sec
+
+                    chunk_index = self._next_chunk_index
+                    self._next_chunk_index += 1
+
+                    timestamp = time.time()
+                    empty_result = TranscriptionResult(
+                        text="",
+                        segments=[],
+                        duration=chunk_duration_sec,
+                        language=None,
+                    )
+
                     try:
                         if not chunk_array.size:
+                            self._register_chunk_result(
+                                chunk_index,
+                                chunk_offset,
+                                chunk_duration_sec,
+                                timestamp,
+                                empty_result,
+                                callback,
+                            )
                             return
 
-                        rms = math.sqrt(float(np.mean(chunk_array**2)))
+                        rms = math.sqrt(float(np.mean(chunk_array**2))) if chunk_array.size else 0.0
+
                         if rms < self.silence_threshold:
+                            silent_result = TranscriptionResult(
+                                text="",
+                                segments=[],
+                                duration=chunk_duration_sec,
+                                language=None,
+                            )
+                            self._register_chunk_result(
+                                chunk_index,
+                                chunk_offset,
+                                chunk_duration_sec,
+                                timestamp,
+                                silent_result,
+                                callback,
+                            )
                             return
 
                         audio_array = _prepare_audio_array(chunk_array)
                         if not audio_array.size:
+                            self._register_chunk_result(
+                                chunk_index,
+                                chunk_offset,
+                                chunk_duration_sec,
+                                timestamp,
+                                empty_result,
+                                callback,
+                            )
                             return
 
                         result = transcribe_audio(
@@ -749,19 +1114,25 @@ class StreamTranscriber:
                             condition_on_previous_text=False,
                         )
 
-                        addition = _merge_with_history(result.text, self._emitted_history)
-
-                        if callback and addition:
-                            self._cumulative_text = f"{self._cumulative_text} {addition}".strip()
-                            callback({
-                                'text': addition,
-                                'language': result.language,
-                                'timestamp': time.time(),
-                                'duration': result.duration,
-                            })
-
                     except Exception as e:
                         print(f"Ошибка: {e}")
+                        self._register_chunk_result(
+                            chunk_index,
+                            chunk_offset,
+                            chunk_duration_sec,
+                            timestamp,
+                            empty_result,
+                            callback,
+                        )
+                    else:
+                        self._register_chunk_result(
+                            chunk_index,
+                            chunk_offset,
+                            chunk_duration_sec,
+                            timestamp,
+                            result,
+                            callback,
+                        )
 
                 if use_threading:
                     self.thread_pool.submit(flush_chunk)
@@ -769,11 +1140,12 @@ class StreamTranscriber:
                     flush_chunk()
         
         print("Начинаю потоковую транскрибацию.")
-        
+
         # Запускаем обработку аудио в отдельном потоке
         self.processing_thread = threading.Thread(target=process_audio_chunks)
         self.processing_thread.daemon = True
         self.processing_thread.start()
+        self.processing_threads = [self.processing_thread]
         
         try:
             self.audio_stream = sd.InputStream(
@@ -790,7 +1162,51 @@ class StreamTranscriber:
             print(f"Ошибка запуска аудиопотока: {e}")
             self.recording = False
             return False
-    
+
+    def _register_chunk_result(
+        self,
+        chunk_index: int,
+        chunk_offset: float,
+        chunk_duration: float,
+        emitted_time: float,
+        result: TranscriptionResult,
+        callback,
+    ) -> None:
+        if self._buffer_manager is None:
+            return
+
+        with self._chunk_lock:
+            self._pending_chunks[chunk_index] = (chunk_offset, chunk_duration, emitted_time, result)
+
+            while self._next_chunk_to_emit in self._pending_chunks:
+                (ready_offset, ready_duration, ready_time, ready_result) = self._pending_chunks.pop(self._next_chunk_to_emit)
+                self._next_chunk_to_emit += 1
+
+                additions = self._buffer_manager.push(
+                    ready_result.segments,
+                    chunk_offset=ready_offset,
+                    chunk_duration=ready_duration,
+                )
+
+                for addition in additions:
+                    if not addition:
+                        continue
+
+                    self._cumulative_text = f"{self._cumulative_text} {addition}".strip()
+
+                    language = ready_result.language or self._last_language
+                    if ready_result.language:
+                        self._last_language = ready_result.language
+
+                    effective_callback = callback or self._callback
+                    if effective_callback:
+                        effective_callback({
+                            'text': addition,
+                            'language': language,
+                            'timestamp': ready_time,
+                            'duration': ready_result.duration,
+                        })
+
     def stop(self):
         """Stop streaming transcription."""
         if not self.recording:
@@ -807,12 +1223,33 @@ class StreamTranscriber:
         # Останавливаем пул потоков
         if hasattr(self, 'thread_pool'):
             self.thread_pool.shutdown(wait=False)
-        
+
         # Останавливаем основной поток обработки
         for thread in self.processing_threads:
             if thread.is_alive():
                 thread.join(timeout=0.5)
-        
+
+        final_chunks: List[str] = []
+        if self._buffer_manager is not None:
+            final_chunks = self._buffer_manager.finalize()
+
+        for addition in final_chunks:
+            if not addition:
+                continue
+
+            self._cumulative_text = f"{self._cumulative_text} {addition}".strip()
+
+            effective_callback = self._callback
+            if effective_callback:
+                effective_callback({
+                    'text': addition,
+                    'language': self._last_language,
+                    'timestamp': time.time(),
+                    'duration': 0.0,
+                })
+
+        self._pending_chunks.clear()
+
         print("Транскрибация остановлена.")
     
     def is_recording(self):
@@ -828,6 +1265,10 @@ def stream_transcribe(
     chunk_duration: Optional[float] = None,
     language: Optional[str] = None,
     profile: Optional[StreamProfile] = None,
+    buffer_strategy: Optional[str] = None,
+    buffer_pause: Optional[float] = None,
+    buffer_trimming: Optional[bool] = None,
+    buffer_trimming_sec: Optional[float] = None,
     callback=None,
 ) -> None:
     """Stream transcription in real-time with callback for results."""
@@ -848,6 +1289,12 @@ def stream_transcribe(
         overlap_ratio=active_profile.overlap_ratio,
         temperature=active_profile.temperature,
         use_threading=active_profile.use_threading,
+        buffer_strategy=buffer_strategy or active_profile.buffer_strategy,
+        buffer_pause=buffer_pause if buffer_pause is not None else active_profile.buffer_pause,
+        buffer_trimming=buffer_trimming if buffer_trimming is not None else active_profile.buffer_trimming,
+        buffer_trimming_sec=(
+            buffer_trimming_sec if buffer_trimming_sec is not None else active_profile.buffer_trimming_sec
+        ),
         callback=callback,
     ):
         return

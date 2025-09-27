@@ -1,5 +1,6 @@
 import sys
 import types
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 
@@ -30,6 +31,8 @@ _install_stub_module("soundfile")
 _install_stub_module("ffmpeg")
 _install_stub_module("faster_whisper", WhisperModel=object)
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
 from sts import transcriber
 
 
@@ -52,6 +55,61 @@ class LoadModelFallbackTests(unittest.TestCase):
 
         self.assertIsInstance(model, DummyModel)
         self.assertEqual(model.compute_type, "int8")
+
+
+class BufferManagerTests(unittest.TestCase):
+    def test_sentence_manager_emits_after_punctuation(self):
+        manager = transcriber.SentenceBufferManager(pause_threshold=0.5, trimming_enabled=False)
+
+        emitted = manager.push(
+            [
+                transcriber.TranscriptionSegment(start=0.0, end=0.4, text="Привет,"),
+                transcriber.TranscriptionSegment(start=0.4, end=0.7, text="мир."),
+            ],
+            chunk_offset=0.0,
+            chunk_duration=0.7,
+        )
+
+        self.assertEqual(emitted, ["Привет, мир."])
+
+    def test_sentence_manager_uses_pause_to_finalize(self):
+        manager = transcriber.SentenceBufferManager(pause_threshold=0.6, trimming_enabled=False)
+
+        first = manager.push(
+            [transcriber.TranscriptionSegment(start=0.0, end=0.5, text="Сегодня хорошая")],
+            chunk_offset=0.0,
+            chunk_duration=0.5,
+        )
+        self.assertEqual(first, [])
+
+        second = manager.push(
+            [transcriber.TranscriptionSegment(start=0.0, end=0.4, text="погода")],
+            chunk_offset=1.4,
+            chunk_duration=0.4,
+        )
+
+        self.assertEqual(second, ["Сегодня хорошая"])
+
+    def test_trimming_flushes_stale_buffer(self):
+        manager = transcriber.SentenceBufferManager(
+            pause_threshold=0.5,
+            trimming_enabled=True,
+            trimming_window=0.5,
+        )
+
+        manager.push(
+            [transcriber.TranscriptionSegment(start=0.0, end=0.2, text="Незавершённая фраза")],
+            chunk_offset=0.0,
+            chunk_duration=0.2,
+        )
+
+        flushed = manager.push(
+            [],
+            chunk_offset=2.0,
+            chunk_duration=0.0,
+        )
+
+        self.assertEqual(flushed, ["Незавершённая фраза"])
 
 
 if __name__ == "__main__":  # pragma: no cover - test entry point

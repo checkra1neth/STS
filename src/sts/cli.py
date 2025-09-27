@@ -10,6 +10,9 @@ from typing import Optional
 
 import sounddevice as sd
 
+BooleanOptionalAction = getattr(argparse, "BooleanOptionalAction", None)
+
+
 from .transcriber import (
     capture_audio,
     load_model,
@@ -146,6 +149,47 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Отключить VAD-фильтр быстрее-шёпота (по умолчанию включён).",
     )
+    if BooleanOptionalAction is not None:
+        parser.add_argument(
+            "--buffer-trimming",
+            action=BooleanOptionalAction,
+            default=None,
+            help=(
+                "Включить или отключить автоматическую очистку буфера потоковой транскрибации."
+                " По умолчанию значение берётся из профиля."
+            ),
+        )
+    else:
+        trimming_group = parser.add_mutually_exclusive_group()
+        trimming_group.add_argument(
+            "--buffer-trimming",
+            dest="buffer_trimming",
+            action="store_true",
+            help=(
+                "Включить автоматическую очистку буфера потоковой транскрибации."
+                " По умолчанию значение берётся из профиля."
+            ),
+        )
+        trimming_group.add_argument(
+            "--no-buffer-trimming",
+            dest="buffer_trimming",
+            action="store_false",
+            help=(
+                "Отключить автоматическую очистку буфера потоковой транскрибации."
+                " По умолчанию значение берётся из профиля."
+            ),
+        )
+        parser.set_defaults(buffer_trimming=None)
+
+    parser.add_argument(
+        "--buffer-trimming-sec",
+        type=float,
+        default=None,
+        help=(
+            "Сколько секунд хранить непроверённый текст в буфере перед принудительным выводом."
+            " По умолчанию значение берётся из профиля."
+        ),
+    )
     return parser
 
 
@@ -265,6 +309,8 @@ def main(argv: Optional[list[str]] = None) -> None:
             device=_parse_input_device(args.input_device),
             language=requested_language,
             profile=profile,
+            buffer_trimming=args.buffer_trimming,
+            buffer_trimming_sec=args.buffer_trimming_sec,
             callback=print_result
         )
         return
