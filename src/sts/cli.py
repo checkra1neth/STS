@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
@@ -146,6 +147,38 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Отключить VAD-фильтр быстрее-шёпота (по умолчанию включён).",
     )
+    vac_group = parser.add_mutually_exclusive_group()
+    vac_group.add_argument(
+        "--vac",
+        dest="vac",
+        action="store_true",
+        help="Включить Silero VAC перед инференсом в потоковом режиме.",
+    )
+    vac_group.add_argument(
+        "--no-vac",
+        dest="vac",
+        action="store_false",
+        help="Отключить Silero VAC и использовать энергетику для сегментации.",
+    )
+    parser.set_defaults(vac=True)
+    parser.add_argument(
+        "--vac-window",
+        type=float,
+        default=None,
+        help="Длительность окна VAC в секундах для агрегирования аудиофреймов.",
+    )
+    parser.add_argument(
+        "--vac-min-silence",
+        type=float,
+        default=None,
+        help="Минимальная длительность паузы (сек), после которой сегмент считается завершённым.",
+    )
+    parser.add_argument(
+        "--vac-pad",
+        type=float,
+        default=None,
+        help="Запас (сек) по краям сегмента речи для VAC.",
+    )
     return parser
 
 
@@ -245,6 +278,15 @@ def main(argv: Optional[list[str]] = None) -> None:
                 model_name = multilingual_candidate
 
         profile = get_best_stream_profile()
+        profile = replace(
+            profile,
+            use_vac=args.vac,
+            vac_window=args.vac_window if args.vac_window is not None else profile.vac_window,
+            vac_min_silence=(
+                args.vac_min_silence if args.vac_min_silence is not None else profile.vac_min_silence
+            ),
+            vac_speech_pad=args.vac_pad if args.vac_pad is not None else profile.vac_speech_pad,
+        )
         cpu_threads = args.cpu_threads if args.cpu_threads is not None else profile.cpu_threads
 
         model = load_model(
