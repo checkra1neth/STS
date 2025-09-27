@@ -22,6 +22,7 @@ try:
 except ImportError:
     HAS_FFMPEG = False
 
+from .vac import VACConfig, VoiceActivityController
 
 @dataclass
 class StreamProfile:
@@ -35,6 +36,10 @@ class StreamProfile:
     temperature: float
     use_threading: bool
     cpu_threads: Optional[int]
+    use_vac: bool
+    vac_window: float
+    vac_min_silence: float
+    vac_speech_pad: float
 
 
 BEST_STREAM_PROFILE = StreamProfile(
@@ -46,6 +51,10 @@ BEST_STREAM_PROFILE = StreamProfile(
     temperature=0.0,
     use_threading=True,
     cpu_threads=4,
+    use_vac=True,
+    vac_window=1.8,
+    vac_min_silence=0.25,
+    vac_speech_pad=0.12,
 )
 
 
@@ -592,12 +601,15 @@ class StreamTranscriber:
         self.silence_threshold = 0.0015
         self._emitted_history: Deque[str] = deque(maxlen=12)
         self._cumulative_text = ""
+        self._vac_controller: Optional[VoiceActivityController] = None
 
     def start(self, model: WhisperModel, device: Optional[int | str] = None,
               samplerate: int = 16_000, channels: int = 2, chunk_duration: float = 5.0,
               language: Optional[str] = None, beam_size: int = 5, vad_filter: bool = True,
               overlap_ratio: float = 0.25, temperature: float = 0.0,
-              use_threading: bool = True, callback=None):
+              use_threading: bool = True, callback=None,
+              use_vac: bool = True, vac_window: float = 1.8,
+              vac_min_silence: float = 0.25, vac_speech_pad: float = 0.12):
         """Start streaming transcription."""
 
         if self.recording:
@@ -614,160 +626,103 @@ class StreamTranscriber:
             else:
                 print("Системное аудиоустройство не найдено.")
         
-        self.audio_queue = queue.Queue(maxsize=100)  # Большая очередь
+        self.audio_queue = queue.Queue(maxsize=100)  # Очередь готовых сегментов
         self.result_queue = queue.Queue()
         self.recording = True
         self._emitted_history.clear()
         self._cumulative_text = ""
 
+        vac_config = VACConfig(
+            samplerate=samplerate,
+            chunk_duration=chunk_duration,
+            overlap_ratio=overlap_ratio,
+            silence_threshold=self.silence_threshold,
+            window_duration=vac_window,
+            min_silence_duration=vac_min_silence,
+            speech_pad=vac_speech_pad,
+            enabled=use_vac,
+        )
+        self._vac_controller = VoiceActivityController(vac_config)
+        if use_vac and self._vac_controller.load_error:
+            print(
+                f"Внимание: контроллер голосовой активности недоступен ({self._vac_controller.load_error}). "
+                "Используется детекция тишины по RMS.",
+                file=sys.stderr,
+            )
+
         # Создаем пул потоков для обработки
         import concurrent.futures
+
         self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=self.max_threads)
-        
-        def audio_callback(indata: np.ndarray, frames: int, time, status) -> None:  # type: ignore[override]
+
+        def audio_callback(indata: np.ndarray, frames: int, time_info, status) -> None:  # type: ignore[override]
             if status:
                 print(status, file=sys.stderr)
-            if self.recording:
-                self.audio_queue.put(indata.copy())
-        
-        min_chunk_duration = max(chunk_duration, 0.4)
-        target_chunk_samples = max(int(min_chunk_duration * samplerate), samplerate // 2)
+            if not self.recording or self._vac_controller is None:
+                return
+
+            frame_copy = indata.copy()
+            for chunk in self._vac_controller.push(frame_copy):
+                if chunk.size:
+                    self.audio_queue.put(chunk)
+
+        def process_chunk(chunk_array: np.ndarray, emitted_time: float) -> None:
+            try:
+                if not chunk_array.size:
+                    return
+
+                if self._vac_controller and self._vac_controller.should_skip_silence(chunk_array):
+                    return
+
+                audio_array = _prepare_audio_array(chunk_array)
+                if not audio_array.size:
+                    return
+
+                result = transcribe_audio(
+                    model,
+                    audio_array,
+                    language=language,
+                    beam_size=beam_size,
+                    temperature=temperature,
+                    vad_filter=vad_filter,
+                    compression_ratio_threshold=1.8,
+                    condition_on_previous_text=False,
+                )
+
+                addition = _merge_with_history(result.text, self._emitted_history)
+
+                if callback and addition and self.recording:
+                    self._cumulative_text = f"{self._cumulative_text} {addition}".strip()
+                    callback({
+                        'text': addition,
+                        'language': result.language,
+                        'timestamp': emitted_time,
+                        'duration': result.duration,
+                    })
+
+            except Exception as e:
+                if self.recording:
+                    print(f"Ошибка: {e}")
+
+        def submit_chunk(chunk_array: np.ndarray, emitted_time: float) -> None:
+            if use_threading:
+                self.thread_pool.submit(process_chunk, chunk_array, emitted_time)
+            else:
+                process_chunk(chunk_array, emitted_time)
 
         def process_audio_chunks():
-            """Process audio chunks in separate thread."""
-            chunk_data: List[np.ndarray] = []
-            chunk_start_time = time.time()
-            chunk_samples = 0
+            """Process ready audio chunks in a separate thread."""
 
             while self.recording or not self.audio_queue.empty():
                 try:
-                    # Получаем аудиоданные с таймаутом
                     audio_chunk = self.audio_queue.get(timeout=0.1)
-                    chunk_data.append(audio_chunk)
-                    chunk_samples += len(audio_chunk)
-
-                    # Проверяем, прошло ли достаточно времени для обработки чанка
-                    current_time = time.time()
-                    duration_ready = current_time - chunk_start_time >= chunk_duration
-                    samples_ready = chunk_samples >= target_chunk_samples
-
-                    if (duration_ready or samples_ready) and chunk_data:
-                        combined_chunk = np.concatenate(chunk_data, axis=0)
-                        processed_samples = combined_chunk.shape[0]
-
-                        if processed_samples and self.recording:
-                            def process_chunk_instant(chunk_array=combined_chunk, emitted_time=current_time):
-                                try:
-                                    if not chunk_array.size:
-                                        return
-
-                                    # Проверяем наличие полезного сигнала, чтобы не тратить время на тишину
-                                    rms = math.sqrt(float(np.mean(chunk_array**2)))
-                                    if rms < self.silence_threshold:
-                                        return
-
-                                    audio_array = _prepare_audio_array(chunk_array)
-                                    if not audio_array.size:
-                                        return
-
-                                    result = transcribe_audio(
-                                        model,
-                                        audio_array,
-                                        language=language,
-                                        beam_size=beam_size,
-                                        temperature=temperature,
-                                        vad_filter=vad_filter,
-                                        compression_ratio_threshold=1.8,
-                                        condition_on_previous_text=False,
-                                    )
-
-                                    addition = _merge_with_history(result.text, self._emitted_history)
-
-                                    if callback and addition and self.recording:
-                                        self._cumulative_text = f"{self._cumulative_text} {addition}".strip()
-                                        callback({
-                                            'text': addition,
-                                            'language': result.language,
-                                            'timestamp': emitted_time,
-                                            'duration': result.duration,
-                                        })
-
-                                except Exception as e:
-                                    if self.recording:
-                                        print(f"Ошибка: {e}")
-
-                            if use_threading:
-                                self.thread_pool.submit(process_chunk_instant)
-                            else:
-                                process_chunk_instant()
-
-                        if overlap_ratio > 0 and processed_samples > 0:
-                            overlap_samples = int(processed_samples * overlap_ratio)
-                            if overlap_samples > 0:
-                                chunk_data = [combined_chunk[-overlap_samples:]]
-                                chunk_samples = overlap_samples
-                            else:
-                                chunk_data = []
-                                chunk_samples = 0
-                        else:
-                            chunk_data = []
-                            chunk_samples = 0
-
-                        chunk_start_time = current_time
-
                 except queue.Empty:
                     continue
-                except Exception as e:
-                    if self.recording:
-                        print(f"Ошибка обработки аудио: {e}")
+
+                if audio_chunk is None:
                     break
 
-            if chunk_data and chunk_samples:
-                combined_chunk = np.concatenate(chunk_data, axis=0)
-
-                def flush_chunk(chunk_array=combined_chunk):
-                    try:
-                        if not chunk_array.size:
-                            return
-
-                        rms = math.sqrt(float(np.mean(chunk_array**2)))
-                        if rms < self.silence_threshold:
-                            return
-
-                        audio_array = _prepare_audio_array(chunk_array)
-                        if not audio_array.size:
-                            return
-
-                        result = transcribe_audio(
-                            model,
-                            audio_array,
-                            language=language,
-                            beam_size=beam_size,
-                            temperature=temperature,
-                            vad_filter=vad_filter,
-                            compression_ratio_threshold=1.8,
-                            condition_on_previous_text=False,
-                        )
-
-                        addition = _merge_with_history(result.text, self._emitted_history)
-
-                        if callback and addition:
-                            self._cumulative_text = f"{self._cumulative_text} {addition}".strip()
-                            callback({
-                                'text': addition,
-                                'language': result.language,
-                                'timestamp': time.time(),
-                                'duration': result.duration,
-                            })
-
-                    except Exception as e:
-                        print(f"Ошибка: {e}")
-
-                if use_threading:
-                    self.thread_pool.submit(flush_chunk)
-                else:
-                    flush_chunk()
-        
+                submit_chunk(audio_chunk, time.time())
         print("Начинаю потоковую транскрибацию.")
         
         # Запускаем обработку аудио в отдельном потоке
@@ -803,7 +758,16 @@ class StreamTranscriber:
             self.audio_stream.stop()
             self.audio_stream.close()
             self.audio_stream = None
-        
+
+        if self.audio_queue is not None and self._vac_controller is not None:
+            try:
+                for chunk in self._vac_controller.finalize():
+                    if chunk.size:
+                        self.audio_queue.put(chunk)
+                self.audio_queue.put(None)
+            except Exception as e:
+                print(f"Ошибка завершения VAC: {e}")
+
         # Останавливаем пул потоков
         if hasattr(self, 'thread_pool'):
             self.thread_pool.shutdown(wait=False)
@@ -849,6 +813,10 @@ def stream_transcribe(
         temperature=active_profile.temperature,
         use_threading=active_profile.use_threading,
         callback=callback,
+        use_vac=active_profile.use_vac,
+        vac_window=active_profile.vac_window,
+        vac_min_silence=active_profile.vac_min_silence,
+        vac_speech_pad=active_profile.vac_speech_pad,
     ):
         return
 
