@@ -11,8 +11,9 @@ from typing import Optional
 import sounddevice as sd
 
 from .transcriber import (
+    DEFAULT_BACKEND_NAME,
     capture_audio,
-    load_model,
+    load_transcription_backend,
     transcribe_audio,
     extract_audio_from_video,
     is_video_file,
@@ -20,6 +21,8 @@ from .transcriber import (
     find_system_audio_devices,
     stream_transcribe,
     get_best_stream_profile,
+    list_backend_names,
+    replay_stream_trace,
 )
 
 
@@ -39,6 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
             "через оптимизированную сборку Whisper."
         )
     )
+    backend_choices = list_backend_names()
     source_group = parser.add_mutually_exclusive_group(required=False)
     source_group.add_argument(
         "--input",
@@ -69,6 +73,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--model",
         default="small",
         help="Размер модели Whisper. small — оптимальный баланс качества и скорости для CPU и поддерживает многие языки.",
+    )
+    parser.add_argument(
+        "--backend",
+        default=DEFAULT_BACKEND_NAME,
+        choices=backend_choices,
+        help="Бэкенд распознавания (faster-whisper, whisper-timestamped, openai-api и др.)",
+    )
+    parser.add_argument(
+        "--model-dir",
+        type=Path,
+        default=None,
+        help="Каталог с локальными весами моделей (используется прежде всего для offline-бэкендов).",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help="Каталог кэша для скачивания моделей (по умолчанию используется значение из бэкенда).",
     )
     parser.add_argument(
         "--device",
@@ -146,6 +168,32 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Отключить VAD-фильтр быстрее-шёпота (по умолчанию включён).",
     )
+    parser.add_argument(
+        "--simulate-trace",
+        type=Path,
+        default=None,
+        help=(
+            "Путь к JSONL-файлу с офлайн-трассой потоковой транскрибации. "
+            "Используйте совместно с --stream для воспроизведения результатов без модели."
+        ),
+    )
+    parser.add_argument(
+        "--simulation-speed",
+        type=float,
+        default=1.0,
+        help="Коэффициент ускорения при воспроизведении офлайн-трассы (1.0 = реальное время).",
+    )
+    parser.add_argument(
+        "--simulation-loop",
+        action="store_true",
+        help="Повторять воспроизведение трассы по кругу, пока не будет нажато Ctrl+C.",
+    )
+    parser.add_argument(
+        "--simulation-warmup",
+        type=float,
+        default=0.0,
+        help="Задержка перед началом воспроизведения трассы в секундах.",
+    )
     return parser
 
 
@@ -218,7 +266,10 @@ def main(argv: Optional[list[str]] = None) -> None:
     args = parser.parse_args(argv)
 
     _maybe_list_devices(args.list_devices)
-    
+
+    normalized_backend = args.backend.lower().replace("_", "-")
+    is_faster_whisper_backend = normalized_backend in {"faster-whisper", "fwhisper", "default"}
+
     # Проверяем, что выбран один из источников
     if not any([args.input, args.record, args.system_audio, args.web, args.stream]):
         parser.error("Необходимо выбрать один из: --input, --record, --system-audio, --web, или --stream")
@@ -234,7 +285,12 @@ def main(argv: Optional[list[str]] = None) -> None:
         requested_language = args.language.lower() if args.language else None
         model_name = args.model
 
-        if requested_language and requested_language != "en" and model_name.endswith(".en"):
+        if (
+            is_faster_whisper_backend
+            and requested_language
+            and requested_language != "en"
+            and model_name.endswith(".en")
+        ):
             multilingual_candidate = model_name[: -len(".en")]
             if multilingual_candidate:
                 print(
@@ -244,28 +300,46 @@ def main(argv: Optional[list[str]] = None) -> None:
                 )
                 model_name = multilingual_candidate
 
-        profile = get_best_stream_profile()
-        cpu_threads = args.cpu_threads if args.cpu_threads is not None else profile.cpu_threads
-
-        model = load_model(
-            model_name,
-            device=args.device,
-            compute_type=args.compute_type,
-            cpu_threads=cpu_threads,
-        )
-
         def print_result(result):
             print(f"[{result['language']}] {result['text']}")
             if args.output:
                 with open(args.output, 'a', encoding='utf-8') as f:
                     f.write(f"{result['text']} ")
 
+        if args.simulate_trace:
+            try:
+                replay_stream_trace(
+                    args.simulate_trace,
+                    callback=print_result,
+                    speed=args.simulation_speed,
+                    loop=args.simulation_loop,
+                    warmup=args.simulation_warmup,
+                )
+            except KeyboardInterrupt:
+                pass
+            return
+
+        profile = get_best_stream_profile()
+        cpu_threads = args.cpu_threads if args.cpu_threads is not None else profile.cpu_threads
+
+        backend = load_transcription_backend(
+            args.backend,
+            model_name,
+            device=args.device,
+            compute_type=args.compute_type,
+            cpu_threads=cpu_threads,
+            model_dir=args.model_dir,
+            cache_dir=args.cache_dir,
+        )
+
         stream_transcribe(
-            model=model,
+            backend,
             device=_parse_input_device(args.input_device),
+            samplerate=args.samplerate,
+            channels=args.channels,
             language=requested_language,
             profile=profile,
-            callback=print_result
+            callback=print_result,
         )
         return
 
@@ -274,7 +348,12 @@ def main(argv: Optional[list[str]] = None) -> None:
     requested_language = args.language.lower() if args.language else None
     model_name = args.model
 
-    if requested_language and requested_language != "en" and model_name.endswith(".en"):
+    if (
+        is_faster_whisper_backend
+        and requested_language
+        and requested_language != "en"
+        and model_name.endswith(".en")
+    ):
         multilingual_candidate = model_name[: -len(".en")]
         if multilingual_candidate:
             print(
@@ -293,14 +372,18 @@ def main(argv: Optional[list[str]] = None) -> None:
     try:
         audio_path, is_temp_file = _resolve_input_file(args)
 
-        model = load_model(
+        backend = load_transcription_backend(
+            args.backend,
             model_name,
             device=args.device,
             compute_type=args.compute_type,
             cpu_threads=args.cpu_threads,
+            model_dir=args.model_dir,
+            cache_dir=args.cache_dir,
         )
 
-        if requested_language and requested_language != "en" and not getattr(model, "is_multilingual", True):
+        handle = getattr(backend, "handle", None)
+        if requested_language and requested_language != "en" and not getattr(handle, "is_multilingual", True):
             print(
                 "Загруженная модель поддерживает только английский язык. Выберите многоязычную модель (например, small).",
                 file=sys.stderr,
@@ -308,7 +391,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             raise SystemExit(1)
 
         result = transcribe_audio(
-            model,
+            backend,
             audio_path,
             beam_size=args.beam_size,
             language=requested_language,

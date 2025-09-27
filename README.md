@@ -84,6 +84,38 @@ python -m sts.cli --record --input-device "MacBook Pro Microphone" --output tran
 python -m sts.cli --system-audio --input-device "BlackHole 2ch" --output transcript.txt
 ```
 
+### Выбор бэкенда и управление кэшем
+
+CLI поддерживает несколько бэкендов распознавания, которые выбираются через флаг `--backend`:
+
+- `faster-whisper` — локальный инференс с fallback на `int8` и гибкой настройкой потоков.
+- `whisper-timestamped` — совместим с пакетом `whisper_timestamped`, если он установлен.
+- `openai-api` — обращается к облачному API OpenAI (требуется установленный пакет `openai` и ключ API).
+
+Чтобы переопределить каталог с локальными весами или кэшем, используйте флаги `--model-dir` и `--cache-dir`:
+
+```bash
+python -m sts.cli --input audio.wav --backend faster-whisper --model-dir ~/models --cache-dir ~/.cache/whisper
+```
+
+Если в указанном каталоге уже лежит распакованная модель (папка с весами), она будет использована без повторного скачивания.
+
+### Симуляция потоковой транскрибации
+
+Для отладки интерфейсов можно воспроизводить заранее записанные трассы потоковых событий. Формат трассы — JSONL, где каждая строка содержит поля `timestamp`, `text`, `language` и опционально `duration`.
+
+```bash
+python -m sts.cli --stream --simulate-trace traces/sample.jsonl --simulation-speed 2.0
+```
+
+Параметры симуляции:
+
+- `--simulation-speed` — ускорение или замедление (1.0 — реальное время).
+- `--simulation-loop` — зациклить воспроизведение до `Ctrl+C`.
+- `--simulation-warmup` — задержка перед стартом, полезно для подготовки UI.
+
+См. модуль `sts.transcriber.replay_stream_trace` для программного доступа к этим функциям, а также smoke-тест `tests/test_transcriber.py::ReplayTraceTests` для минимального примера трассы.
+
 ### Оптимизация под Mac M1 Pro
 
 - **CPU-инференс**: по умолчанию используется устройство `cpu`, что даёт стабильную работу без необходимости настраивать GPU.
